@@ -1,0 +1,17 @@
+# ESP-IDF build outputs & temporary files
+build/
+sdkconfig
+sdkconfig.old
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+
+# Language Server / Indexer caches
+.clangd/
+.cache/
+
+# System / OS generated files
+.DS_Store
+Thumbs.db
