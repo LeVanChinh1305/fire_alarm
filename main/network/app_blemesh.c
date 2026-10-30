@@ -1,6 +1,25 @@
-﻿#include "app_blemesh.h"
-#include "app_config.h"
+﻿/**
+ * @file    app_blemesh.c
+ * @brief   BLE Mesh Node – Fire Alarm S3
+ *          Cấu trúc: 15 model Server (2 element) + Vendor Server 0x8888/0x0000
+ *          Cải tiến so với phiên bản cũ:
+ *            1. 3 AppKey HOMI thật (thay 0x00 cũ).
+ *            2. GatewayJoin bất đồng bộ qua Queue + Task (tránh HCI timeout).
+ *            3. Vendor callback rõ ràng hơn: log đầy đủ, đếm bản tin, parse cấu trúc.
+ *            4. Subscribe Group 0xC000 cho OnOff Srv và Vendor Srv sau khi bind.
+ *            5. Lưu/khôi phục cấu hình qua NVS.
+ */
 
+#include "app_blemesh.h"
+#include "app_config.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+#include "esp_timer.h"
+#include "esp_mac.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
 #include "esp_ble_mesh_common_api.h"
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_defs.h"
@@ -10,71 +29,142 @@
 #include "esp_ble_mesh_local_data_operation_api.h"
 #include "esp_ble_mesh_networking_api.h"
 #include "esp_ble_mesh_provisioning_api.h"
-#include "esp_bt.h"
-#include "esp_bt_device.h"
-#include "esp_bt_main.h"
 
-#include "esp_mac.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "APP_MESH";
 
-// ==================== Biến toàn cục quản lý mesh ====================
-static bool g_bMeshInitialized = false;
-static bool g_bProvisioned = false;
-static uint16_t g_u16NetIdx = 0;      // Chỉ số mạng (Network Key Index)
-static uint16_t g_u16AppIdx = 0;      // Chỉ số ứng dụng (AppKey Index) của AppKey cuối cùng được thêm
-static uint16_t g_u16Unicast = 0;     // Địa chỉ Unicast của node trong mạng BLE Mesh (cấp sau khi Provision)
-static uint8_t g_u8OnOffState = 0;    // Trạng thái OnOff hiện tại của Server
-
-// ==================== UUID của thiết bị (16 byte) ====================
-static uint8_t g_au8DevUuid[16] = {
-    0x32, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-// ==================== Config Server ====================
-static esp_ble_mesh_cfg_srv_t g_stCfgSrv = {
-    .relay = ESP_BLE_MESH_RELAY_DISABLED,
-    .beacon = ESP_BLE_MESH_BEACON_ENABLED,
-#if defined(CONFIG_BLE_MESH_GATT_PROXY_SERVER)
-    .gatt_proxy = ESP_BLE_MESH_GATT_PROXY_ENABLED,
-#else
-    .gatt_proxy = ESP_BLE_MESH_GATT_PROXY_NOT_SUPPORTED,
+/* ============================================================
+ *  DEFINES
+ * ============================================================ */
+#ifndef ROLE_NODE
+#define ROLE_NODE 0
 #endif
-    .friend_state = ESP_BLE_MESH_FRIEND_NOT_SUPPORTED, // Tắt tính năng Friend Node
-    .default_ttl = 7,                                  // Số bước chuyển tiếp tối đa
-    .net_transmit = ESP_BLE_MESH_TRANSMIT(2, 20),       // Phát thêm 2 lần (tổng 3 lần), cách nhau 20 ms
-    .relay_retransmit = ESP_BLE_MESH_TRANSMIT(2, 20),  // Cấu hình phát lại nếu Relay được bật về sau
+
+#define DF_LOCK_TIMEOUT_MS      500
+#define NVS_NAMESPACE           "meshgw"
+#define NVS_KEY_NETIDX          "netidx"
+#define NVS_KEY_GROUP           "group"
+
+/* ============================================================
+ *  SỰ KIỆN NỘI BỘ (Queue + Task)
+ * ============================================================ */
+typedef enum {
+    MESH_EVT_ENABLED = 0,       /* Mesh stack sẵn sàng (sau prov enable)      */
+    MESH_EVT_PROV_COMPLETE,     /* Provision thành công                       */
+    MESH_EVT_PROV_RESET,        /* Node bị reset                              */
+    MESH_EVT_LOCAL_APPKEY_ADD,  /* Kết quả add AppKey cục bộ                 */
+    MESH_EVT_LOCAL_APP_BIND,    /* Kết quả bind AppKey vào model              */
+    MESH_EVT_LOCAL_SUB_ADD,     /* Kết quả subscribe Group                   */
+    MESH_EVT_ONOFF_SET,         /* OnOff Server nhận SET                      */
+    MESH_EVT_VENDOR_MSG,        /* Vendor Model nhận bản tin                  */
+} en_mesh_evt_t;
+
+typedef struct {
+    en_mesh_evt_t eType;
+    int64_t       s64TimeUs;
+    uint16_t      u16Src;
+    uint16_t      u16Dst;
+    uint16_t      u16Param;
+    uint16_t      u16ModelId;
+    int           iErrCode;
+    uint8_t       u8OnOff;
+    uint8_t       u8Ttl;
+    int8_t        s8Rssi;
+} st_mesh_evt_t;
+
+/* ============================================================
+ *  BIẾN TRẠNG THÁI TOÀN CỤC
+ * ============================================================ */
+typedef struct {
+    bool     bProvisioned;
+    uint16_t u16Unicast;
+    uint16_t u16NetIdx;
+    uint16_t u16AppIdx;     /* AppIdx chính (HOMI_APP_KEY_IDX_0 = 0x0000) */
+    bool     bAppBound;
+    uint16_t u16Group;
+    uint8_t  u8OnOffState;
+    uint32_t u32RxVendorCount;  /* Đếm tổng số bản tin Vendor nhận được    */
+} st_mesh_info_t;
+
+static st_mesh_info_t    g_stInfo;
+static bool              g_bMeshInitialized  = false;
+static QueueHandle_t     g_hMeshEvtQ         = NULL;
+static TaskHandle_t      g_hMeshTask         = NULL;
+static SemaphoreHandle_t g_hMeshMutex        = NULL;
+static uint32_t          g_u32DropEvt        = 0;
+
+/* ---- Gateway Join state ---- */
+static bool     g_bGatewayConfigStarted = false;
+static bool     g_bGatewayJoined        = false;
+static uint8_t  g_u8AppKeyReadyMask     = 0;       /* Bit i = AppKey[i] đã thêm */
+static uint8_t  g_u8BindPendingCount    = 0;
+static uint8_t  g_u8BindFailedCount     = 0;
+static uint8_t  g_u8GroupPendingCount   = 0;
+static bool     g_bGroupConfigFailed    = false;
+static uint16_t g_u16ConfiguredGroup    = DF_MESH_GROUP_FIRE_ALARM;
+static uint16_t g_u16ProvisionedNetIdx  = DF_MESH_HOMI_NET_KEY_IDX;
+
+/* ============================================================
+ *  3 APPKEY HOMI THẬT
+ *  (Thay thế key 0x00 cũ – đây là keys tương thích với Gateway HOMI)
+ * ============================================================ */
+static const uint8_t HOMI_APP_KEY_0[16] = {
+    0x16, 0xE7, 0xC9, 0x34, 0xEB, 0x3F, 0x5A, 0x8B,
+    0xDB, 0x63, 0x2A, 0x09, 0x6A, 0xA8, 0x2C, 0xAC,
+};
+static const uint8_t HOMI_APP_KEY_1[16] = {
+    0xF0, 0x7E, 0xE1, 0xB4, 0xEF, 0x3C, 0xFE, 0x00,
+    0xD7, 0x08, 0x43, 0xF6, 0x3D, 0x0A, 0xBC, 0xAB,
+};
+static const uint8_t HOMI_APP_KEY_2[16] = {
+    0xB3, 0xAA, 0x31, 0xD0, 0x7A, 0xFB, 0x8D, 0x21,
+    0x54, 0x2D, 0x85, 0x35, 0x33, 0xE6, 0xC3, 0xDD,
 };
 
-// ==================== 15 MODEL (giống nút bấm HOMI 0x0065) ====================
-// Element 0 (13 model): Config Srv, Health Srv, Health Cli, Generic OnOff Srv,
-// Generic Level Srv, Generic Default Transition Time Srv, Generic Power OnOff Srv,
-// Generic Power OnOff Setup Srv, Light Lightness Srv, Light Lightness Setup Srv,
-// Light CTL Srv, Light CTL Setup Srv, Vendor 0x8888/0x0000
-// Element 1 (2 model): Generic Level Srv, Light CTL Temperature Srv
+/* ============================================================
+ *  UUID THIẾT BỊ
+ * ============================================================ */
+static uint8_t g_au8DevUuid[16] = { 0x32, 0x10 };  /* MAC điền vào [2..7] khi init */
 
-#define DF_SRV_RSP_AUTO \
-    { .get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP, \
-      .set_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP }
+/* ============================================================
+ *  CONFIG SERVER
+ * ============================================================ */
+static esp_ble_mesh_cfg_srv_t g_stCfgSrv = {
+    .relay       = ESP_BLE_MESH_RELAY_DISABLED,
+    .beacon      = ESP_BLE_MESH_BEACON_ENABLED,
+#if defined(CONFIG_BLE_MESH_GATT_PROXY_SERVER)
+    .gatt_proxy  = ESP_BLE_MESH_GATT_PROXY_ENABLED,
+#else
+    .gatt_proxy  = ESP_BLE_MESH_GATT_PROXY_NOT_SUPPORTED,
+#endif
+    .friend_state     = ESP_BLE_MESH_FRIEND_NOT_SUPPORTED,
+    .default_ttl      = 7,
+    .net_transmit     = ESP_BLE_MESH_TRANSMIT(2, 20),
+    .relay_retransmit = ESP_BLE_MESH_TRANSMIT(2, 20),
+};
 
-/* ---------- Publication: mỗi model một buffer riêng ---------- */
-ESP_BLE_MESH_HEALTH_PUB_DEFINE(g_stHealthPub, 8, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stOnoffPub, 2 + 3, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLevelPub, 2 + 5, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stDttPub, 2 + 1, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stPwrPub, 2 + 1, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stPwrSetupPub, 2 + 1, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLightnessPub, 2 + 5, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLightnessSetupPub, 2 + 5, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlPub, 2 + 9, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlSetupPub, 2 + 9, ROLE_NODE);
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLevel2Pub, 2 + 5, ROLE_NODE);  // element 1
-ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlTempPub, 2 + 9, ROLE_NODE); // element 1
+/* ============================================================
+ *  PUBLICATION BUFFERS (mỗi model một buffer riêng)
+ * ============================================================ */
+ESP_BLE_MESH_HEALTH_PUB_DEFINE(g_stHealthPub,       8,       ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stOnoffPub,         2 + 3,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLevelPub,         2 + 5,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stDttPub,           2 + 1,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stPwrPub,           2 + 1,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stPwrSetupPub,      2 + 1,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLightnessPub,     2 + 5,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLightnessSetupPub,2 + 5,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlPub,           2 + 9,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlSetupPub,      2 + 9,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stLevel2Pub,        2 + 5,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stCtlTempPub,       2 + 9,  ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(g_stVndSrvPub,        3 + sizeof(st_vendor_custom_data_t), ROLE_NODE);
 
-/* ---------- Health ---------- */
-/* Health Server bắt buộc có ít nhất 1 test ID, không có -> esp_ble_mesh_init lỗi -22 */
+/* ============================================================
+ *  HEALTH SERVER
+ * ============================================================ */
 static const uint8_t g_au8HealthTestIds[] = { 0x00 };
 static esp_ble_mesh_health_srv_t g_stHealthSrv = {
     .health_test.id_count = ARRAY_SIZE(g_au8HealthTestIds),
@@ -82,171 +172,88 @@ static esp_ble_mesh_health_srv_t g_stHealthSrv = {
 };
 static esp_ble_mesh_client_t g_stHealthCli;
 
-/* ---------- State dùng chung giữa server và setup server (theo spec/API) ---------- */
+/* ============================================================
+ *  GENERIC SERVER STATES
+ * ============================================================ */
+#define DF_SRV_RSP_AUTO \
+    { .get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP, \
+      .set_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP }
+
 static esp_ble_mesh_gen_onpowerup_state_t g_stOnPowerUpState;
 
+static esp_ble_mesh_gen_onoff_srv_t g_stOnoffSrv = {
+    .rsp_ctrl = DF_SRV_RSP_AUTO
+};
+static esp_ble_mesh_gen_level_srv_t g_stLevelSrv = {
+    .rsp_ctrl = DF_SRV_RSP_AUTO
+};
+static esp_ble_mesh_gen_level_srv_t g_stLevel2Srv = {    /* Element 1 */
+    .rsp_ctrl = DF_SRV_RSP_AUTO
+};
+static esp_ble_mesh_gen_def_trans_time_srv_t g_stDttSrv = {
+    .rsp_ctrl = DF_SRV_RSP_AUTO
+};
+static esp_ble_mesh_gen_power_onoff_srv_t g_stPwrSrv = {
+    .rsp_ctrl = DF_SRV_RSP_AUTO,
+    .state    = &g_stOnPowerUpState
+};
+static esp_ble_mesh_gen_power_onoff_setup_srv_t g_stPwrSetupSrv = {
+    .rsp_ctrl = DF_SRV_RSP_AUTO,
+    .state    = &g_stOnPowerUpState
+};
+
+/* ============================================================
+ *  LIGHTING SERVER STATES
+ * ============================================================ */
 static esp_ble_mesh_light_lightness_state_t g_stLightnessState = {
     .lightness_range_min = 1,
     .lightness_range_max = 0xFFFF,
-    .lightness_default = 0xFFFF,
+    .lightness_default   = 0xFFFF,
 };
-
 static esp_ble_mesh_light_ctl_state_t g_stCtlState = {
-    .lightness_default = 0xFFFF,
-    .temperature = 4000,
-    .temperature_default = 4000,
+    .lightness_default     = 0xFFFF,
+    .temperature           = 4000,
+    .temperature_default   = 4000,
     .temperature_range_min = 800,
     .temperature_range_max = 20000,
 };
 
-/* ---------- Generic servers ---------- */
-static esp_ble_mesh_gen_onoff_srv_t g_stOnoffSrv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO
-};
-
-static esp_ble_mesh_gen_level_srv_t g_stLevelSrv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO
-};
-
-static esp_ble_mesh_gen_level_srv_t g_stLevel2Srv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO
-};
-
-static esp_ble_mesh_gen_def_trans_time_srv_t g_stDttSrv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO
-};
-
-static esp_ble_mesh_gen_power_onoff_srv_t g_stPwrSrv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stOnPowerUpState
-};
-
-static esp_ble_mesh_gen_power_onoff_setup_srv_t g_stPwrSetupSrv = {
-    .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stOnPowerUpState
-};
-
-/* ---------- Lighting servers ---------- */
 static esp_ble_mesh_light_lightness_srv_t g_stLightnessSrv = {
     .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stLightnessState
+    .state    = &g_stLightnessState
 };
-
 static esp_ble_mesh_light_lightness_setup_srv_t g_stLightnessSetupSrv = {
     .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stLightnessState
+    .state    = &g_stLightnessState
 };
-
 static esp_ble_mesh_light_ctl_srv_t g_stCtlSrv = {
     .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stCtlState
+    .state    = &g_stCtlState
 };
-
 static esp_ble_mesh_light_ctl_setup_srv_t g_stCtlSetupSrv = {
     .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stCtlState
+    .state    = &g_stCtlState
 };
-
-static esp_ble_mesh_light_ctl_temp_srv_t g_stCtlTempSrv = {
+static esp_ble_mesh_light_ctl_temp_srv_t g_stCtlTempSrv = { /* Element 1 */
     .rsp_ctrl = DF_SRV_RSP_AUTO,
-    .state = &g_stCtlState
+    .state    = &g_stCtlState
 };
 
-// ==================== Element 0: SIG models ====================
-static esp_ble_mesh_model_t g_astRootModels[] = {
-    ESP_BLE_MESH_MODEL_CFG_SRV(&g_stCfgSrv),
-    ESP_BLE_MESH_MODEL_HEALTH_SRV(&g_stHealthSrv, &g_stHealthPub),
-    ESP_BLE_MESH_MODEL_HEALTH_CLI(&g_stHealthCli),
-    ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&g_stOnoffPub, &g_stOnoffSrv),
-    ESP_BLE_MESH_MODEL_GEN_LEVEL_SRV(&g_stLevelPub, &g_stLevelSrv),
-    ESP_BLE_MESH_MODEL_GEN_DEF_TRANS_TIME_SRV(&g_stDttPub, &g_stDttSrv),
-    ESP_BLE_MESH_MODEL_GEN_POWER_ONOFF_SRV(&g_stPwrPub, &g_stPwrSrv),
-    ESP_BLE_MESH_MODEL_GEN_POWER_ONOFF_SETUP_SRV(&g_stPwrSetupPub, &g_stPwrSetupSrv),
-    ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_SRV(&g_stLightnessPub, &g_stLightnessSrv),
-    ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_SETUP_SRV(&g_stLightnessSetupPub, &g_stLightnessSetupSrv),
-    ESP_BLE_MESH_MODEL_LIGHT_CTL_SRV(&g_stCtlPub, &g_stCtlSrv),
-    ESP_BLE_MESH_MODEL_LIGHT_CTL_SETUP_SRV(&g_stCtlSetupPub, &g_stCtlSetupSrv),
-};
-
-// ==================== Element 1: SIG models ====================
-static esp_ble_mesh_model_t g_astSecModels[] = {
-    ESP_BLE_MESH_MODEL_GEN_LEVEL_SRV(&g_stLevel2Pub, &g_stLevel2Srv),
-    ESP_BLE_MESH_MODEL_LIGHT_CTL_TEMP_SRV(&g_stCtlTempPub, &g_stCtlTempSrv),
-};
-
-// ==================== Vendor model (element 0) ====================
-// Đăng ký toàn bộ 64 opcode (0x00-0x3F) làm tấm lưới hứng mọi bản tin vendor
+/* ============================================================
+ *  VENDOR MODEL – đăng ký 64 opcode (0x00-0x3F)
+ *  Chiến lược "lưới opcode" để hứng mọi bản tin Vendor của HOMI
+ *  bất kể opcode byte nào Gateway gửi.
+ * ============================================================ */
 #define VND_OP(n) ESP_BLE_MESH_MODEL_OP(DF_VND_OPCODE(n), 0)
+#define VND_OPS_8(b) \
+    VND_OP((b)+0), VND_OP((b)+1), VND_OP((b)+2), VND_OP((b)+3), \
+    VND_OP((b)+4), VND_OP((b)+5), VND_OP((b)+6), VND_OP((b)+7)
 
 static esp_ble_mesh_model_op_t g_astVndServerOp[] = {
-    VND_OP(0x00),
-    VND_OP(0x01),
-    VND_OP(0x02),
-    VND_OP(0x03),
-    VND_OP(0x04),
-    VND_OP(0x05),
-    VND_OP(0x06),
-    VND_OP(0x07),
-    VND_OP(0x08),
-    VND_OP(0x09),
-    VND_OP(0x0A),
-    VND_OP(0x0B),
-    VND_OP(0x0C),
-    VND_OP(0x0D),
-    VND_OP(0x0E),
-    VND_OP(0x0F),
-
-    VND_OP(0x10),
-    VND_OP(0x11),
-    VND_OP(0x12),
-    VND_OP(0x13),
-    VND_OP(0x14),
-    VND_OP(0x15),
-    VND_OP(0x16),
-    VND_OP(0x17),
-    VND_OP(0x18),
-    VND_OP(0x19),
-    VND_OP(0x1A),
-    VND_OP(0x1B),
-    VND_OP(0x1C),
-    VND_OP(0x1D),
-    VND_OP(0x1E),
-    VND_OP(0x1F),
-
-    VND_OP(0x20),
-    VND_OP(0x21),
-    VND_OP(0x22),
-    VND_OP(0x23),
-    VND_OP(0x24),
-    VND_OP(0x25),
-    VND_OP(0x26),
-    VND_OP(0x27),
-    VND_OP(0x28),
-    VND_OP(0x29),
-    VND_OP(0x2A),
-    VND_OP(0x2B),
-    VND_OP(0x2C),
-    VND_OP(0x2D),
-    VND_OP(0x2E),
-    VND_OP(0x2F),
-
-    VND_OP(0x30),
-    VND_OP(0x31),
-    VND_OP(0x32),
-    VND_OP(0x33),
-    VND_OP(0x34),
-    VND_OP(0x35),
-    VND_OP(0x36),
-    VND_OP(0x37),
-    VND_OP(0x38),
-    VND_OP(0x39),
-    VND_OP(0x3A),
-    VND_OP(0x3B),
-    VND_OP(0x3C),
-    VND_OP(0x3D),
-    VND_OP(0x3E),
-    VND_OP(0x3F),
-
+    VND_OPS_8(0x00), VND_OPS_8(0x08),
+    VND_OPS_8(0x10), VND_OPS_8(0x18),
+    VND_OPS_8(0x20), VND_OPS_8(0x28),
+    VND_OPS_8(0x30), VND_OPS_8(0x38),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
@@ -255,139 +262,204 @@ static esp_ble_mesh_model_t g_astVndModels[] = {
         DF_MESH_VND_COMPANY_ID,
         DF_MESH_VND_MODEL_ID_SERVER,
         g_astVndServerOp,
-        NULL,
+        &g_stVndSrvPub,
         NULL
     ),
 };
 
-// ==================== Elements + Composition ====================
+/* ============================================================
+ *  ELEMENT 0: 12 SIG Server + Health CLI  (13 models)  +  Vendor (1)
+ *  ELEMENT 1: 2 SIG Server
+ * ============================================================ */
+static esp_ble_mesh_model_t g_astRootModels[] = {
+    /* [0]  */ ESP_BLE_MESH_MODEL_CFG_SRV(&g_stCfgSrv),
+    /* [1]  */ ESP_BLE_MESH_MODEL_HEALTH_SRV(&g_stHealthSrv, &g_stHealthPub),
+    /* [2]  */ ESP_BLE_MESH_MODEL_HEALTH_CLI(&g_stHealthCli),
+    /* [3]  */ ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&g_stOnoffPub, &g_stOnoffSrv),
+    /* [4]  */ ESP_BLE_MESH_MODEL_GEN_LEVEL_SRV(&g_stLevelPub, &g_stLevelSrv),
+    /* [5]  */ ESP_BLE_MESH_MODEL_GEN_DEF_TRANS_TIME_SRV(&g_stDttPub, &g_stDttSrv),
+    /* [6]  */ ESP_BLE_MESH_MODEL_GEN_POWER_ONOFF_SRV(&g_stPwrPub, &g_stPwrSrv),
+    /* [7]  */ ESP_BLE_MESH_MODEL_GEN_POWER_ONOFF_SETUP_SRV(&g_stPwrSetupPub, &g_stPwrSetupSrv),
+    /* [8]  */ ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_SRV(&g_stLightnessPub, &g_stLightnessSrv),
+    /* [9]  */ ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_SETUP_SRV(&g_stLightnessSetupPub, &g_stLightnessSetupSrv),
+    /* [10] */ ESP_BLE_MESH_MODEL_LIGHT_CTL_SRV(&g_stCtlPub, &g_stCtlSrv),
+    /* [11] */ ESP_BLE_MESH_MODEL_LIGHT_CTL_SETUP_SRV(&g_stCtlSetupPub, &g_stCtlSetupSrv),
+};
+
+static esp_ble_mesh_model_t g_astSecModels[] = {
+    /* [0]  */ ESP_BLE_MESH_MODEL_GEN_LEVEL_SRV(&g_stLevel2Pub, &g_stLevel2Srv),
+    /* [1]  */ ESP_BLE_MESH_MODEL_LIGHT_CTL_TEMP_SRV(&g_stCtlTempPub, &g_stCtlTempSrv),
+};
+
 static esp_ble_mesh_elem_t g_astElements[] = {
     ESP_BLE_MESH_ELEMENT(0, g_astRootModels, g_astVndModels),
-    ESP_BLE_MESH_ELEMENT(0, g_astSecModels, ESP_BLE_MESH_MODEL_NONE),
+    ESP_BLE_MESH_ELEMENT(0, g_astSecModels,  ESP_BLE_MESH_MODEL_NONE),
 };
 
 static esp_ble_mesh_comp_t g_stComp = {
-    .cid = 0x02E5, // Company ID Espressif
+    .cid           = DF_MESH_COMPANY_ID,
     .element_count = ARRAY_SIZE(g_astElements),
-    .elements = g_astElements,
+    .elements      = g_astElements,
 };
 
 static esp_ble_mesh_prov_t g_stProv = {
     .uuid = g_au8DevUuid,
 };
 
-// ==================== Gateway Join: cấu hình ====================
-#define DF_HOMI_APPKEY_IDX 0x0000 // Kiểm tra lại đúng AppKey Index của mạng HOMI
-#define DF_HOMI_GROUP_ADDR 0xC000
-
-/* TODO: điền 16 byte AppKey HOMI lấy từ code gốc */
-static const uint8_t g_au8HomiAppKey[16] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
+/* ============================================================
+ *  DANH SÁCH MODEL CẦN BIND / SUBSCRIBE
+ *  (Config Server dùng DevKey – không bind AppKey, bỏ qua)
+ * ============================================================ */
 typedef struct {
-    uint8_t u8Elem;       // 0 hoặc 1
-    uint16_t u16Cid;      // ESP_BLE_MESH_CID_NVAL cho SIG model
+    uint8_t  u8Elem;     /* 0 hoặc 1 */
+    uint16_t u16Cid;     /* ESP_BLE_MESH_CID_NVAL = SIG model */
     uint16_t u16ModelId;
-    bool bSub;            // có subscribe Group 0xC000 hay không
+    bool     bSub;       /* true = cũng subscribe Group */
 } df_join_item_t;
 
-/* 14 model (trừ Config Server vì Config Server dùng DevKey, không bind AppKey) */
 static const df_join_item_t g_astJoin[] = {
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_CLI, false },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_LEVEL_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_DEF_TRANS_TIME_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_POWER_ONOFF_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_POWER_ONOFF_SETUP_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_LIGHTNESS_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_LIGHTNESS_SETUP_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_SRV, true },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_SETUP_SRV, true },
-    { 0, DF_MESH_VND_COMPANY_ID, DF_MESH_VND_MODEL_ID_SERVER, true },
-    { 1, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_LEVEL_SRV, true },
-    { 1, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_TEMP_SRV, true },
+    /* Element 0 – SIG models */
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_SRV,                    true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_CLI,                    false },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_SRV,                 true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_LEVEL_SRV,                 true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_DEF_TRANS_TIME_SRV,        true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_POWER_ONOFF_SRV,           true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_POWER_ONOFF_SETUP_SRV,     true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_LIGHTNESS_SRV,           true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_LIGHTNESS_SETUP_SRV,     true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_SRV,                 true  },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_SETUP_SRV,           true  },
+    /* Element 0 – Vendor model (quan trọng nhất!) */
+    { 0, DF_MESH_VND_COMPANY_ID, DF_MESH_VND_MODEL_ID_SERVER,                        true  },
+    /* Element 1 */
+    { 1, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_LEVEL_SRV,                 true  },
+    { 1, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_LIGHT_CTL_TEMP_SRV,            true  },
 };
 
-static SemaphoreHandle_t g_semAppKey = NULL;
-static volatile bool g_bJoinRunning = false;
+/* ============================================================
+ *  FORWARD DECLARATIONS
+ * ============================================================ */
+static void    app_mesh_PostEvt(const st_mesh_evt_t *pstEvt);
+static void    app_mesh_Task(void *pvParameters);
+static int32_t app_mesh_GatewayJoinNetwork(uint16_t u16NetIdx);
+static void    app_mesh_StartGatewayModelConfig(void);
+static void    app_mesh_UpdateGatewayReady(void);
+static void    app_mesh_LoadConfig(void);
+static void    app_mesh_SaveConfig(void);
 
-// ==================== Callback ====================
-static void app_mesh_ProvCb(
-    esp_ble_mesh_prov_cb_event_t event,
-    esp_ble_mesh_prov_cb_param_t *param
-) {
-    switch (event) {
+/* ============================================================
+ *  HELPER: Đẩy sự kiện vào Queue (gọi được từ callback ISR-context)
+ * ============================================================ */
+static void app_mesh_PostEvt(const st_mesh_evt_t *pstEvt)
+{
+    if (g_hMeshEvtQ == NULL) return;
+    if (xQueueSend(g_hMeshEvtQ, pstEvt, 0) != pdTRUE) {
+        g_u32DropEvt++;
+        LREP_WARNING(TAG, "[EVT] Queue day, bo qua event type=%d (tong=%lu)",
+                     (int)pstEvt->eType, (unsigned long)g_u32DropEvt);
+    }
+}
+
+/* ============================================================
+ *  HELPER: Kiểm tra model đã có AppKey chưa
+ * ============================================================ */
+static bool app_mesh_ModelHasAppKey(const esp_ble_mesh_model_t *pstModel, uint16_t u16AppIdx)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(pstModel->keys); i++) {
+        if (pstModel->keys[i] == u16AppIdx) return true;
+    }
+    return false;
+}
+
+/* ============================================================
+ *  CALLBACK: Provisioning
+ *  *** Chỉ PostEvt, KHÔNG làm gì nặng bên trong ***
+ * ============================================================ */
+static void app_mesh_ProvCb(esp_ble_mesh_prov_cb_event_t eEvent,
+                            esp_ble_mesh_prov_cb_param_t *pstParam)
+{
+    st_mesh_evt_t stEvt = { .s64TimeUs = esp_timer_get_time() };
+
+    switch (eEvent) {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
-        LREP(TAG, "PROV_REGISTER_COMP, err_code %d",
-             param->prov_register_comp.err_code);
+        LREP(TAG, "PROV_REGISTER_COMP err=%d", pstParam->prov_register_comp.err_code);
         break;
 
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
-        LREP(TAG, "NODE_PROV_ENABLE_COMP, err_code %d",
-             param->node_prov_enable_comp.err_code);
+        LREP(TAG, "[PROV] Node enable xong (err=%d)", pstParam->node_prov_enable_comp.err_code);
+        stEvt.eType = MESH_EVT_ENABLED;
+        app_mesh_PostEvt(&stEvt);
         break;
 
     case ESP_BLE_MESH_NODE_PROV_LINK_OPEN_EVT:
-        LREP(TAG, "PROV_LINK_OPEN, bearer %s",
-             param->node_prov_link_open.bearer == ESP_BLE_MESH_PROV_ADV
-                 ? "PB-ADV"
-                 : "PB-GATT");
+        LREP(TAG, "[PROV] Link OPEN: %s",
+             pstParam->node_prov_link_open.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT");
         break;
 
     case ESP_BLE_MESH_NODE_PROV_LINK_CLOSE_EVT:
-        LREP(TAG, "PROV_LINK_CLOSE, bearer %s",
-             param->node_prov_link_close.bearer == ESP_BLE_MESH_PROV_ADV
-                 ? "PB-ADV"
-                 : "PB-GATT");
+        LREP(TAG, "[PROV] Link CLOSE: %s",
+             pstParam->node_prov_link_close.bearer == ESP_BLE_MESH_PROV_ADV ? "PB-ADV" : "PB-GATT");
         break;
 
     case ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT:
-        LREP(TAG, "=== PROVISION Hoàn Tất ===");
-        LREP(TAG, "  NetIdx  : 0x%04x", param->node_prov_complete.net_idx);
-        LREP(TAG, "  Unicast : 0x%04x", param->node_prov_complete.addr);
-        LREP(TAG, "  Flags   : 0x%02x", param->node_prov_complete.flags);
-        LREP(TAG, "  IV Index: 0x%08lx",
-             (unsigned long)param->node_prov_complete.iv_index);
-
-        g_bProvisioned = true;
-        g_u16NetIdx = param->node_prov_complete.net_idx;
-        g_u16Unicast = param->node_prov_complete.addr;
-
+        LREP(TAG, "=== PROVISION HOAN TAT ===");
+        LREP(TAG, "  NetIdx  : 0x%04X", pstParam->node_prov_complete.net_idx);
+        LREP(TAG, "  Unicast : 0x%04X", pstParam->node_prov_complete.addr);
+        stEvt.eType    = MESH_EVT_PROV_COMPLETE;
+        stEvt.u16Src   = pstParam->node_prov_complete.net_idx;
+        stEvt.u16Param = pstParam->node_prov_complete.addr;
+        app_mesh_PostEvt(&stEvt);
         break;
 
     case ESP_BLE_MESH_NODE_PROV_RESET_EVT:
-        LREP(TAG, "NODE_PROV_RESET");
-        g_bProvisioned = false;
-        g_u16Unicast = 0;
+        LREP_WARNING(TAG, "[PROV] Nhan su kien RESET provisioning");
+        stEvt.eType = MESH_EVT_PROV_RESET;
+        app_mesh_PostEvt(&stEvt);
         break;
 
+    /* ---- Kết quả thêm AppKey cục bộ (do GatewayJoin gọi) ---- */
     case ESP_BLE_MESH_NODE_ADD_LOCAL_APP_KEY_COMP_EVT:
-        LREP(TAG, "[JOIN] ADD_APPKEY err %d, net 0x%04x, app 0x%04x",
-             param->node_add_app_key_comp.err_code,
-             param->node_add_app_key_comp.net_idx,
-             param->node_add_app_key_comp.app_idx);
-        if (g_semAppKey) {
-            xSemaphoreGive(g_semAppKey);
-        }
+        LREP(TAG, "[JOIN] ADD_APPKEY: net=0x%04X app=0x%04X err=%d",
+             pstParam->node_add_app_key_comp.net_idx,
+             pstParam->node_add_app_key_comp.app_idx,
+             pstParam->node_add_app_key_comp.err_code);
+        stEvt.eType    = MESH_EVT_LOCAL_APPKEY_ADD;
+        stEvt.u16Src   = pstParam->node_add_app_key_comp.net_idx;
+        stEvt.u16Param = pstParam->node_add_app_key_comp.app_idx;
+        stEvt.iErrCode = pstParam->node_add_app_key_comp.err_code;
+        app_mesh_PostEvt(&stEvt);
         break;
 
+    /* ---- Kết quả bind AppKey vào model cục bộ ---- */
     case ESP_BLE_MESH_NODE_BIND_APP_KEY_TO_MODEL_COMP_EVT:
-        LREP(TAG, "[JOIN] BIND_COMP err %d, elem 0x%04x, cid 0x%04x, mod 0x%04x",
-             param->node_bind_app_key_to_model_comp.err_code,
-             param->node_bind_app_key_to_model_comp.element_addr,
-             param->node_bind_app_key_to_model_comp.company_id,
-             param->node_bind_app_key_to_model_comp.model_id);
+        LREP(TAG, "[JOIN] BIND_COMP: elem=0x%04X cid=0x%04X mod=0x%04X app=0x%04X err=%d",
+             pstParam->node_bind_app_key_to_model_comp.element_addr,
+             pstParam->node_bind_app_key_to_model_comp.company_id,
+             pstParam->node_bind_app_key_to_model_comp.model_id,
+             pstParam->node_bind_app_key_to_model_comp.app_idx,
+             pstParam->node_bind_app_key_to_model_comp.err_code);
+        stEvt.eType    = MESH_EVT_LOCAL_APP_BIND;
+        stEvt.u16Src   = pstParam->node_bind_app_key_to_model_comp.element_addr;
+        stEvt.u16Param = pstParam->node_bind_app_key_to_model_comp.app_idx;
+        stEvt.u16ModelId = pstParam->node_bind_app_key_to_model_comp.model_id;
+        stEvt.iErrCode = pstParam->node_bind_app_key_to_model_comp.err_code;
+        app_mesh_PostEvt(&stEvt);
         break;
 
+    /* ---- Kết quả subscribe Group ---- */
     case ESP_BLE_MESH_MODEL_SUBSCRIBE_GROUP_ADDR_COMP_EVT:
-        LREP(TAG, "[JOIN] SUB_COMP err %d, elem 0x%04x, mod 0x%04x, grp 0x%04x",
-             param->model_sub_group_addr_comp.err_code,
-             param->model_sub_group_addr_comp.element_addr,
-             param->model_sub_group_addr_comp.model_id,
-             param->model_sub_group_addr_comp.group_addr);
+        LREP(TAG, "[JOIN] SUB_COMP: elem=0x%04X mod=0x%04X grp=0x%04X err=%d",
+             pstParam->model_sub_group_addr_comp.element_addr,
+             pstParam->model_sub_group_addr_comp.model_id,
+             pstParam->model_sub_group_addr_comp.group_addr,
+             pstParam->model_sub_group_addr_comp.err_code);
+        stEvt.eType    = MESH_EVT_LOCAL_SUB_ADD;
+        stEvt.u16Src   = pstParam->model_sub_group_addr_comp.element_addr;
+        stEvt.u16ModelId = pstParam->model_sub_group_addr_comp.model_id;
+        stEvt.u16Param = pstParam->model_sub_group_addr_comp.group_addr;
+        stEvt.iErrCode = pstParam->model_sub_group_addr_comp.err_code;
+        app_mesh_PostEvt(&stEvt);
         break;
 
     default:
@@ -395,25 +467,464 @@ static void app_mesh_ProvCb(
     }
 }
 
-static void app_mesh_ConfigServerCb(
-    esp_ble_mesh_cfg_server_cb_event_t event,
-    esp_ble_mesh_cfg_server_cb_param_t *param
-) {
-    if (event == ESP_BLE_MESH_CFG_SERVER_STATE_CHANGE_EVT) {
-        switch (param->ctx.recv_op) {
-        case ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD:
-            LREP(TAG, "APP_KEY_ADD: net_idx 0x%04x, app_idx 0x%04x",
-                 param->value.state_change.appkey_add.net_idx,
-                 param->value.state_change.appkey_add.app_idx);
-            g_u16AppIdx = param->value.state_change.appkey_add.app_idx;
-            app_mesh_GatewayJoin(); // Tu dong bind tat ca model sau khi nRF Mesh add AppKey
+/* ============================================================
+ *  CALLBACK: Config Server
+ *  Ghi nhận khi Provisioner thêm AppKey / bind model qua OTA.
+ *  Sau khi Provisioner add AppKey → tự động gọi GatewayJoin.
+ * ============================================================ */
+static void app_mesh_ConfigServerCb(esp_ble_mesh_cfg_server_cb_event_t eEvent,
+                                    esp_ble_mesh_cfg_server_cb_param_t *pstParam)
+{
+    if (eEvent != ESP_BLE_MESH_CFG_SERVER_STATE_CHANGE_EVT) return;
+
+    switch (pstParam->ctx.recv_op) {
+    case ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD:
+        LREP(TAG, "[CFG SRV] APP_KEY_ADD: net=0x%04X app=0x%04X",
+             pstParam->value.state_change.appkey_add.net_idx,
+             pstParam->value.state_change.appkey_add.app_idx);
+        /* Provisioner đã add AppKey → ta tự bind/subscribe thêm cho Vendor model */
+        app_mesh_GatewayJoin();
+        break;
+
+    case ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND:
+        LREP(TAG, "[CFG SRV] MODEL_APP_BIND: elem=0x%04X app=0x%04X mod=0x%04X",
+             pstParam->value.state_change.mod_app_bind.element_addr,
+             pstParam->value.state_change.mod_app_bind.app_idx,
+             pstParam->value.state_change.mod_app_bind.model_id);
+        break;
+
+    case ESP_BLE_MESH_MODEL_OP_MODEL_SUB_ADD:
+        LREP(TAG, "[CFG SRV] MODEL_SUB_ADD: elem=0x%04X mod=0x%04X grp=0x%04X",
+             pstParam->value.state_change.mod_sub_add.element_addr,
+             pstParam->value.state_change.mod_sub_add.model_id,
+             pstParam->value.state_change.mod_sub_add.sub_addr);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ============================================================
+ *  CALLBACK: Generic Server
+ * ============================================================ */
+static void app_mesh_GenericServerCb(esp_ble_mesh_generic_server_cb_event_t eEvent,
+                                     esp_ble_mesh_generic_server_cb_param_t *pstParam)
+{
+    if (pstParam == NULL || eEvent != ESP_BLE_MESH_GENERIC_SERVER_STATE_CHANGE_EVT) return;
+
+    st_mesh_evt_t stEvt = {
+        .s64TimeUs = esp_timer_get_time(),
+        .u16Src    = pstParam->ctx.addr,
+        .u16Dst    = pstParam->ctx.recv_dst,
+        .u8Ttl     = pstParam->ctx.recv_ttl,
+    };
+
+    switch (pstParam->ctx.recv_op) {
+    case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET:
+    case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK:
+        stEvt.eType  = MESH_EVT_ONOFF_SET;
+        stEvt.u8OnOff = pstParam->value.state_change.onoff_set.onoff;
+        LREP(TAG, "[GEN] OnOff -> %s (src=0x%04X)", stEvt.u8OnOff ? "ON" : "OFF", stEvt.u16Src);
+        app_mesh_PostEvt(&stEvt);
+        break;
+
+    case ESP_BLE_MESH_MODEL_OP_GEN_LEVEL_SET:
+    case ESP_BLE_MESH_MODEL_OP_GEN_LEVEL_SET_UNACK:
+        LREP(TAG, "[GEN] Level[elem %d] -> %d (src=0x%04X)",
+             pstParam->model->element_idx,
+             pstParam->value.state_change.level_set.level,
+             pstParam->ctx.addr);
+        break;
+
+    case ESP_BLE_MESH_MODEL_OP_GEN_ONPOWERUP_SET:
+    case ESP_BLE_MESH_MODEL_OP_GEN_ONPOWERUP_SET_UNACK:
+        LREP(TAG, "[GEN] OnPowerUp -> %u", pstParam->value.state_change.onpowerup_set.onpowerup);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ============================================================
+ *  CALLBACK: Lighting Server
+ * ============================================================ */
+static void app_mesh_LightingServerCb(esp_ble_mesh_lighting_server_cb_event_t eEvent,
+                                      esp_ble_mesh_lighting_server_cb_param_t *pstParam)
+{
+    if (pstParam == NULL || eEvent != ESP_BLE_MESH_LIGHTING_SERVER_STATE_CHANGE_EVT) return;
+
+    switch (pstParam->ctx.recv_op) {
+    case ESP_BLE_MESH_MODEL_OP_LIGHT_LIGHTNESS_SET:
+    case ESP_BLE_MESH_MODEL_OP_LIGHT_LIGHTNESS_SET_UNACK:
+        LREP(TAG, "[LIGHT] Lightness -> %u", pstParam->value.state_change.lightness_set.lightness);
+        break;
+    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_SET:
+    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_SET_UNACK:
+        LREP(TAG, "[LIGHT] CTL -> lightness=%u temp=%u duv=%d",
+             pstParam->value.state_change.ctl_set.lightness,
+             pstParam->value.state_change.ctl_set.temperature,
+             pstParam->value.state_change.ctl_set.delta_uv);
+        break;
+    default:
+        break;
+    }
+}
+
+/* ============================================================
+ *  CALLBACK: Vendor Model
+ *  *** Quan trọng: KHÔNG block, KHÔNG delay, chỉ log + đếm ***
+ *
+ *  Lý do nhận vài bản tin rồi dừng ở bản cũ:
+ *    - callback block quá lâu → HCI command timeout
+ *    - Vendor model chưa được bind AppKey / subscribe Group đúng
+ *  Giải pháp: log nhanh, cập nhật counter, rồi trả về ngay.
+ * ============================================================ */
+static void app_mesh_CustomModelCb(esp_ble_mesh_model_cb_event_t eEvent,
+                                   esp_ble_mesh_model_cb_param_t *pstParam)
+{
+    if (eEvent != ESP_BLE_MESH_MODEL_OPERATION_EVT) return;
+    if (pstParam == NULL ||
+        pstParam->model_operation.model == NULL ||
+        pstParam->model_operation.ctx   == NULL) return;
+
+    /* Chỉ xử lý Vendor Model của mình */
+    if (pstParam->model_operation.model->vnd.company_id != DF_MESH_VND_COMPANY_ID) return;
+
+    uint32_t opcode  = pstParam->model_operation.opcode;
+    uint16_t length  = pstParam->model_operation.length;
+    uint8_t *data    = pstParam->model_operation.msg;
+    uint16_t src     = pstParam->model_operation.ctx->addr;
+    uint16_t dst     = pstParam->model_operation.ctx->recv_dst;
+    uint8_t  ttl     = pstParam->model_operation.ctx->recv_ttl;
+    int8_t   rssi    = pstParam->model_operation.ctx->recv_rssi;
+    uint8_t  op_idx  = (uint8_t)((opcode >> 16) & 0x3F);
+
+    /* ---- Cập nhật counter (mutex-free, chấp nhận race nhỏ trong context này) ---- */
+    g_stInfo.u32RxVendorCount++;
+
+    /* ---- Log nhanh một dòng (không printf nhiều dòng) ---- */
+    LREP(TAG, "[VND RX #%lu] op=0x%02X src=0x%04X dst=0x%04X len=%u ttl=%u rssi=%d",
+         (unsigned long)g_stInfo.u32RxVendorCount,
+         op_idx, src, dst, length, ttl, rssi);
+
+    /* ---- In hex payload (tối đa 16 byte để tránh chiếm quá lâu) ---- */
+    if (length > 0 && data != NULL) {
+        char acHex[64] = {0};
+        uint16_t n = (length > 16) ? 16 : length;
+        for (uint16_t i = 0; i < n; i++) {
+            snprintf(acHex + i * 3, sizeof(acHex) - i * 3, "%02X ", data[i]);
+        }
+        LREP_DEBUG(TAG, "  Payload: %s%s", acHex, (length > 16) ? "..." : "");
+    }
+
+    /* ---- Parse theo OpIdx ---- */
+    switch (op_idx) {
+    case 0x01: /* SET – cấu trúc st_vendor_custom_data_t */
+        if (length >= sizeof(st_vendor_custom_data_t) && data != NULL) {
+            const st_vendor_custom_data_t *p = (const st_vendor_custom_data_t *)data;
+            LREP(TAG, "  [SET] cmd=0x%02X pkt=%u temp=%.1f°C smoke=%u ppm alarm=%u tag=%.*s",
+                 p->u8Cmd, p->u16PacketId,
+                 (float)p->s16Temperature / 10.0f,
+                 p->u16SmokeVal,
+                 p->u8AlarmState,
+                 (int)sizeof(p->acDeviceTag), p->acDeviceTag);
+        }
+        break;
+
+    case 0x11: /* NODE_STATUS – nút bấm / đầu khói tự broadcast */
+        if (length >= 2 && data != NULL) {
+            // const char *dev_str = (data[0] == 0x01) ? "NUT BAM" :
+            //                       (data[0] == 0x02) ? "DAU KHOI" : "UNKNOWN";
+            // const char *st_str  = (data[1] == 0x01) ? "BINH THUONG" :
+            //                       (data[1] == 0x02) ? "BAO DONG" :
+            //                       (data[1] == 0x03) ? "KET THUC"  : "UNKNOWN";
+            // if (length >= 8) {
+            //     LREP(TAG, "  [NODE 0x11] %s | %s | MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+            //          dev_str, st_str,
+            //          data[2], data[3], data[4], data[5], data[6], data[7]);
+            // } else {
+            //     LREP(TAG, "  [NODE 0x11] %s | %s", dev_str, st_str);
+            // }
+        }
+        break;
+
+    default:
+        /* Bản tin vendor khác – đã log ở trên, không làm gì thêm */
+        break;
+    }
+}
+
+/* ============================================================
+ *  GATEWAY JOIN – Logic bất đồng bộ
+ * ============================================================ */
+
+/** Kiểm tra và cập nhật cờ g_bGatewayJoined */
+static void app_mesh_UpdateGatewayReady(void)
+{
+    g_bGatewayJoined = g_bGatewayConfigStarted
+                    && (g_u8AppKeyReadyMask == 0x07)
+                    && (g_u8BindPendingCount == 0)
+                    && (g_u8BindFailedCount  == 0)
+                    && (g_u8GroupPendingCount == 0)
+                    && !g_bGroupConfigFailed;
+
+    if (g_bGatewayJoined) {
+        LREP(TAG, "[GW] === GATEWAY JOIN HOAN TAT === Group=0x%04X", g_u16ConfiguredGroup);
+        if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+            g_stInfo.bAppBound = true;
+            g_stInfo.u16Group  = g_u16ConfiguredGroup;
+            xSemaphoreGive(g_hMeshMutex);
+        }
+        app_mesh_SaveConfig();
+    }
+
+    /* Nếu cấu hình thất bại, reset cờ để cho phép thử lại */
+    if (g_bGatewayConfigStarted &&
+        (g_u8BindFailedCount != 0 || g_bGroupConfigFailed)) {
+        LREP_ERROR(TAG, "[GW] GATEWAY JOIN THAT BAI: bind_fail=%u group_fail=%d",
+                   g_u8BindFailedCount, (int)g_bGroupConfigFailed);
+        g_bGatewayConfigStarted = false;
+        g_bGatewayJoined        = false;
+    }
+}
+
+/** Bind tất cả 3 AppKey vào từng model trong g_astJoin */
+static void app_mesh_StartModelBindings(void)
+{
+    const uint16_t u16AppIdx[] = {
+        DF_MESH_HOMI_APP_KEY_IDX_0,
+        DF_MESH_HOMI_APP_KEY_IDX_1,
+        DF_MESH_HOMI_APP_KEY_IDX_2,
+    };
+
+    g_u8BindPendingCount = 0;
+    g_u8BindFailedCount  = 0;
+
+    uint16_t u16PrimAddr = esp_ble_mesh_get_primary_element_address();
+
+    for (size_t ki = 0; ki < ARRAY_SIZE(u16AppIdx); ki++) {
+        for (size_t mi = 0; mi < ARRAY_SIZE(g_astJoin); mi++) {
+            uint16_t u16ElemAddr = u16PrimAddr + g_astJoin[mi].u8Elem;
+
+            /* Tìm con trỏ model để kiểm tra AppKey đã có chưa */
+            esp_ble_mesh_model_t *pstModel = NULL;
+            if (g_astJoin[mi].u8Elem == 0) {
+                if (g_astJoin[mi].u16Cid == DF_MESH_VND_COMPANY_ID) {
+                    pstModel = &g_astVndModels[0];
+                } else {
+                    for (size_t m = 0; m < ARRAY_SIZE(g_astRootModels); m++) {
+                        if (g_astRootModels[m].model_id == g_astJoin[mi].u16ModelId) {
+                            pstModel = &g_astRootModels[m]; break;
+                        }
+                    }
+                }
+            } else {
+                for (size_t m = 0; m < ARRAY_SIZE(g_astSecModels); m++) {
+                    if (g_astSecModels[m].model_id == g_astJoin[mi].u16ModelId) {
+                        pstModel = &g_astSecModels[m]; break;
+                    }
+                }
+            }
+
+            if (pstModel && app_mesh_ModelHasAppKey(pstModel, u16AppIdx[ki])) {
+                continue; /* Đã bind – bỏ qua */
+            }
+
+            esp_err_t err = esp_ble_mesh_node_bind_app_key_to_local_model(
+                u16ElemAddr,
+                g_astJoin[mi].u16Cid,
+                g_astJoin[mi].u16ModelId,
+                u16AppIdx[ki]
+            );
+            if (err == ESP_OK) {
+                g_u8BindPendingCount++;
+            } else {
+                g_u8BindFailedCount++;
+                LREP_ERROR(TAG, "[GW] Queue bind AppKey=0x%03X model=0x%04X fail: %s",
+                           u16AppIdx[ki], g_astJoin[mi].u16ModelId, esp_err_to_name(err));
+            }
+        }
+    }
+
+    LREP(TAG, "[GW] Queued %u bind ops", g_u8BindPendingCount);
+}
+
+/** Subscribe Group cho OnOff Srv + Vendor Srv (hai model quan trọng nhất) */
+static void app_mesh_StartGroupSubscribe(uint16_t u16GroupAddr)
+{
+    uint16_t u16Prim = esp_ble_mesh_get_primary_element_address();
+    g_u8GroupPendingCount = 0;
+    g_bGroupConfigFailed  = false;
+
+    typedef struct { esp_ble_mesh_model_t *pst; uint16_t cid; uint16_t mid; } sub_target_t;
+    sub_target_t aTargets[] = {
+        { &g_astRootModels[3], ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_SRV },
+        { &g_astVndModels[0],  DF_MESH_VND_COMPANY_ID, DF_MESH_VND_MODEL_ID_SERVER },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(aTargets); i++) {
+        /* Kiểm tra đã subscribe chưa */
+        if (esp_ble_mesh_is_model_subscribed_to_group(aTargets[i].pst, u16GroupAddr) != NULL) {
+            continue;
+        }
+        esp_err_t err = esp_ble_mesh_model_subscribe_group_addr(
+            u16Prim, aTargets[i].cid, aTargets[i].mid, u16GroupAddr);
+        if (err == ESP_OK) {
+            g_u8GroupPendingCount++;
+        } else {
+            g_bGroupConfigFailed = true;
+            LREP_ERROR(TAG, "[GW] Subscribe grp 0x%04X model=0x%04X fail: %s",
+                       u16GroupAddr, aTargets[i].mid, esp_err_to_name(err));
+        }
+    }
+
+    LREP(TAG, "[GW] Queued %u subscribe ops", g_u8GroupPendingCount);
+}
+
+/** Được gọi khi tất cả 3 AppKey đã thêm thành công */
+static void app_mesh_StartGatewayModelConfig(void)
+{
+    if (!g_bGatewayConfigStarted || g_u8AppKeyReadyMask != 0x07) return;
+    LREP(TAG, "[GW] Tất cả AppKey sẵn sàng – bắt đầu Bind + Subscribe");
+    app_mesh_StartModelBindings();
+    app_mesh_StartGroupSubscribe(g_u16ConfiguredGroup);
+    app_mesh_UpdateGatewayReady();
+}
+
+/* ============================================================
+ *  NVS: Lưu / Tải cấu hình
+ * ============================================================ */
+static void app_mesh_LoadConfig(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+
+    uint16_t v = 0;
+    if (nvs_get_u16(h, NVS_KEY_NETIDX, &v) == ESP_OK && v <= 0x0FFF) {
+        g_u16ProvisionedNetIdx = v;
+    }
+    if (nvs_get_u16(h, NVS_KEY_GROUP, &v) == ESP_OK && v >= 0xC000 && v <= 0xFEFF) {
+        g_u16ConfiguredGroup = v;
+    }
+    nvs_close(h);
+    LREP(TAG, "[NVS] Load: NetIdx=0x%04X Group=0x%04X",
+         g_u16ProvisionedNetIdx, g_u16ConfiguredGroup);
+}
+
+static void app_mesh_SaveConfig(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u16(h, NVS_KEY_NETIDX, g_u16ProvisionedNetIdx);
+    nvs_set_u16(h, NVS_KEY_GROUP,  g_u16ConfiguredGroup);
+    nvs_commit(h);
+    nvs_close(h);
+    LREP(TAG, "[NVS] Save: NetIdx=0x%04X Group=0x%04X",
+         g_u16ProvisionedNetIdx, g_u16ConfiguredGroup);
+}
+
+/* ============================================================
+ *  TASK XỬ LÝ SỰ KIỆN
+ *  Tất cả logic nặng (bind, subscribe, delay, v.v.) chạy ở đây
+ *  để callback (chạy trên BT task) trả về nhanh nhất có thể.
+ * ============================================================ */
+static void app_mesh_Task(void *pvParameters)
+{
+    st_mesh_evt_t stEvt;
+
+    while (1) {
+        if (xQueueReceive(g_hMeshEvtQ, &stEvt, portMAX_DELAY) != pdTRUE) continue;
+
+        switch (stEvt.eType) {
+
+        /* Mesh stack đã sẵn sàng – nếu đã provision thì tự join */
+        case MESH_EVT_ENABLED: {
+            bool bProv = esp_ble_mesh_node_is_provisioned();
+            uint16_t u16Addr = bProv ? esp_ble_mesh_get_primary_element_address() : 0;
+            if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+                g_stInfo.bProvisioned = bProv;
+                g_stInfo.u16Unicast   = u16Addr;
+                g_stInfo.u16NetIdx    = g_u16ProvisionedNetIdx;
+                xSemaphoreGive(g_hMeshMutex);
+            }
+            LREP(TAG, "[MESH] Stack sẵn sàng. Provisioned=%s Unicast=0x%04X",
+                 bProv ? "YES" : "NO", u16Addr);
+            if (bProv) {
+                vTaskDelay(pdMS_TO_TICKS(500)); /* Chờ link provisioning đóng hẳn */
+                app_mesh_GatewayJoinNetwork(g_u16ProvisionedNetIdx);
+            }
+            break;
+        }
+
+        /* Vừa được provision */
+        case MESH_EVT_PROV_COMPLETE: {
+            uint16_t u16NetIdx = stEvt.u16Src;
+            uint16_t u16Addr   = stEvt.u16Param;
+            g_u16ProvisionedNetIdx = u16NetIdx;
+            if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+                g_stInfo.bProvisioned = true;
+                g_stInfo.u16NetIdx    = u16NetIdx;
+                g_stInfo.u16Unicast   = u16Addr;
+                xSemaphoreGive(g_hMeshMutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000)); /* Chờ provisioning link đóng hẳn */
+            app_mesh_GatewayJoinNetwork(u16NetIdx);
+            break;
+        }
+
+        /* Reset node */
+        case MESH_EVT_PROV_RESET:
+            LREP_WARNING(TAG, "[MESH] Reset provisioning – restarting...");
+            vTaskDelay(pdMS_TO_TICKS(300));
+            esp_restart();
             break;
 
-        case ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND:
-            LREP(TAG, "MODEL_APP_BIND: elem 0x%04x, app_idx 0x%04x, mod_id 0x%04x",
-                 param->value.state_change.mod_app_bind.element_addr,
-                 param->value.state_change.mod_app_bind.app_idx,
-                 param->value.state_change.mod_app_bind.model_id);
+        /* AppKey đã thêm xong */
+        case MESH_EVT_LOCAL_APPKEY_ADD: {
+            int iKeyPos = -1;
+            if (stEvt.u16Param == DF_MESH_HOMI_APP_KEY_IDX_0) iKeyPos = 0;
+            if (stEvt.u16Param == DF_MESH_HOMI_APP_KEY_IDX_1) iKeyPos = 1;
+            if (stEvt.u16Param == DF_MESH_HOMI_APP_KEY_IDX_2) iKeyPos = 2;
+
+            if (stEvt.iErrCode != ESP_OK || iKeyPos < 0) {
+                LREP_ERROR(TAG, "[GW] AppKey add fail: app=0x%04X err=%d",
+                           stEvt.u16Param, stEvt.iErrCode);
+                g_bGatewayConfigStarted = false;
+                break;
+            }
+            g_u8AppKeyReadyMask |= (uint8_t)(1U << iKeyPos);
+            LREP(TAG, "[GW] AppKey[%d] sẵn sàng. Mask=0x%02X", iKeyPos, g_u8AppKeyReadyMask);
+            app_mesh_StartGatewayModelConfig();
+            break;
+        }
+
+        /* Bind AppKey vào model xong */
+        case MESH_EVT_LOCAL_APP_BIND:
+            /* Chỉ đếm các bind của element gốc */
+            if (stEvt.u16Src == esp_ble_mesh_get_primary_element_address() ||
+                stEvt.u16Src == esp_ble_mesh_get_primary_element_address() + 1) {
+                if (g_u8BindPendingCount > 0) g_u8BindPendingCount--;
+                if (stEvt.iErrCode != ESP_OK) g_u8BindFailedCount++;
+            }
+            app_mesh_UpdateGatewayReady();
+            break;
+
+        /* Subscribe Group xong */
+        case MESH_EVT_LOCAL_SUB_ADD:
+            if (g_u8GroupPendingCount > 0) g_u8GroupPendingCount--;
+            if (stEvt.iErrCode != ESP_OK) g_bGroupConfigFailed = true;
+            app_mesh_UpdateGatewayReady();
+            break;
+
+        /* OnOff Server nhận lệnh SET */
+        case MESH_EVT_ONOFF_SET:
+            if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+                g_stInfo.u8OnOffState = stEvt.u8OnOff;
+                xSemaphoreGive(g_hMeshMutex);
+            }
+            g_stOnoffSrv.state.onoff = stEvt.u8OnOff;
             break;
 
         default:
@@ -422,389 +933,286 @@ static void app_mesh_ConfigServerCb(
     }
 }
 
-static void app_mesh_GenericServerCb(
-    esp_ble_mesh_generic_server_cb_event_t event,
-    esp_ble_mesh_generic_server_cb_param_t *param
-) {
-    if (param == NULL || event != ESP_BLE_MESH_GENERIC_SERVER_STATE_CHANGE_EVT) {
-        return;
+/* ============================================================
+ *  app_mesh_GatewayJoinNetwork  – thêm 3 AppKey, trigger bind
+ * ============================================================ */
+static int32_t app_mesh_GatewayJoinNetwork(uint16_t u16NetIdx)
+{
+    if (!g_bMeshInitialized || !esp_ble_mesh_node_is_provisioned()) {
+        LREP_WARNING(TAG, "[GW] Chua provision, bo qua GatewayJoin");
+        return ERROR_CODE_FAIL;
+    }
+    if (esp_ble_mesh_node_get_local_net_key(u16NetIdx) == NULL) {
+        LREP_ERROR(TAG, "[GW] NetKey 0x%04X khong ton tai", u16NetIdx);
+        return ERROR_CODE_NOT_FOUND;
+    }
+    if (g_bGatewayConfigStarted) {
+        return g_bGatewayJoined ? ERROR_CODE_OK : ERROR_CODE_BUSY;
     }
 
-    switch (param->ctx.recv_op) {
-    case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET:
-    case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK:
-        g_u8OnOffState = param->value.state_change.onoff_set.onoff;
-        LREP(TAG, "OnOff -> %s", g_u8OnOffState ? "ON" : "OFF");
-        break;
+    LREP(TAG, "[GW] Bat dau GatewayJoin (NetIdx=0x%04X)", u16NetIdx);
 
-    case ESP_BLE_MESH_MODEL_OP_GEN_LEVEL_SET:
-    case ESP_BLE_MESH_MODEL_OP_GEN_LEVEL_SET_UNACK:
-        LREP(TAG, "Level[elem %d] -> %d",
-             param->model->element_idx,
-             param->value.state_change.level_set.level);
-        break;
+    const uint8_t  *pKeys[]     = { HOMI_APP_KEY_0, HOMI_APP_KEY_1, HOMI_APP_KEY_2 };
+    const uint16_t  u16AppIdx[] = { DF_MESH_HOMI_APP_KEY_IDX_0,
+                                    DF_MESH_HOMI_APP_KEY_IDX_1,
+                                    DF_MESH_HOMI_APP_KEY_IDX_2 };
 
-    case ESP_BLE_MESH_MODEL_OP_GEN_DEF_TRANS_TIME_SET:
-    case ESP_BLE_MESH_MODEL_OP_GEN_DEF_TRANS_TIME_SET_UNACK:
-        LREP(TAG, "DefTransTime -> 0x%02x",
-             param->value.state_change.def_trans_time_set.trans_time);
-        break;
+    g_bGatewayConfigStarted = true;
+    g_bGatewayJoined        = false;
+    g_u8AppKeyReadyMask     = 0;
+    g_u8BindPendingCount    = 0;
+    g_u8BindFailedCount     = 0;
+    g_u8GroupPendingCount   = 0;
+    g_bGroupConfigFailed    = false;
 
-    case ESP_BLE_MESH_MODEL_OP_GEN_ONPOWERUP_SET:
-    case ESP_BLE_MESH_MODEL_OP_GEN_ONPOWERUP_SET_UNACK:
-        LREP(TAG, "OnPowerUp -> %u",
-             param->value.state_change.onpowerup_set.onpowerup);
-        break;
-
-    default:
-        LREP(TAG, "Generic state change, op 0x%08lx",
-             (unsigned long)param->ctx.recv_op);
-        break;
-    }
-}
-
-static void app_mesh_LightingServerCb(
-    esp_ble_mesh_lighting_server_cb_event_t event,
-    esp_ble_mesh_lighting_server_cb_param_t *param
-) {
-    if (param == NULL || event != ESP_BLE_MESH_LIGHTING_SERVER_STATE_CHANGE_EVT) {
-        return;
-    }
-
-    switch (param->ctx.recv_op) {
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_LIGHTNESS_SET:
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_LIGHTNESS_SET_UNACK:
-        LREP(TAG, "Lightness -> %u",
-             param->value.state_change.lightness_set.lightness);
-        break;
-
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_SET:
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_SET_UNACK:
-        LREP(TAG, "CTL -> lightness %u, temp %u, duv %d",
-             param->value.state_change.ctl_set.lightness,
-             param->value.state_change.ctl_set.temperature,
-             param->value.state_change.ctl_set.delta_uv);
-        break;
-
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_TEMPERATURE_SET:
-    case ESP_BLE_MESH_MODEL_OP_LIGHT_CTL_TEMPERATURE_SET_UNACK:
-        LREP(TAG, "CTL Temp -> temp %u, duv %d",
-             param->value.state_change.ctl_temp_set.temperature,
-             param->value.state_change.ctl_temp_set.delta_uv);
-        break;
-
-    default:
-        LREP(TAG, "Lighting state change, op 0x%08lx",
-             (unsigned long)param->ctx.recv_op);
-        break;
-    }
-}
-
-/* ---------- Vendor model callback: hứng và log raw tất cả bản tin ---------- */
-static void app_mesh_CustomModelCb(
-    esp_ble_mesh_model_cb_event_t event,
-    esp_ble_mesh_model_cb_param_t *param
-) {
-    if (event != ESP_BLE_MESH_MODEL_OPERATION_EVT) {
-        return;
-    }
-
-    LREP(TAG, "Vendor RX: opcode=0x%08lx, len=%d, src=0x%04x, dst=0x%04x",
-         (unsigned long)param->model_operation.opcode,
-         param->model_operation.length,
-         param->model_operation.ctx->addr,
-         param->model_operation.ctx->recv_dst);
-
-    /* In raw payload (hex) để quan sát định dạng bản tin */
-    if (param->model_operation.msg && param->model_operation.length > 0) {
-        printf("  Payload (%d bytes):", param->model_operation.length);
-        for (int i = 0; i < param->model_operation.length; i++) {
-            printf(" %02X", param->model_operation.msg[i]);
+    for (size_t i = 0; i < 3; i++) {
+        /* Kiểm tra AppKey đã tồn tại chưa */
+        const uint8_t *pExisting = esp_ble_mesh_node_get_local_app_key(u16AppIdx[i]);
+        if (pExisting != NULL) {
+            if (memcmp(pExisting, pKeys[i], 16) == 0) {
+                /* Đúng key – đánh dấu sẵn sàng ngay */
+                g_u8AppKeyReadyMask |= (uint8_t)(1U << i);
+                LREP(TAG, "[GW] AppKey[%zu] (0x%04X) da ton tai, skip add", i, u16AppIdx[i]);
+                continue;
+            } else {
+                LREP_ERROR(TAG, "[GW] AppKey[%zu] (0x%04X) ton tai nhung KHAC – kich ban loi!",
+                           i, u16AppIdx[i]);
+                g_bGatewayConfigStarted = false;
+                return ERROR_CODE_INVALID_PARAM;
+            }
         }
-        printf("\n");
+
+        esp_err_t err = esp_ble_mesh_node_add_local_app_key(pKeys[i], u16NetIdx, u16AppIdx[i]);
+        if (err != ESP_OK) {
+            LREP_ERROR(TAG, "[GW] Add AppKey[%zu] fail: %s", i, esp_err_to_name(err));
+            g_bGatewayConfigStarted = false;
+            return ERROR_CODE_FAIL;
+        }
+        /* Kết quả sẽ về qua MESH_EVT_LOCAL_APPKEY_ADD */
     }
+
+    /* Nếu tất cả key đã tồn tại → bắt đầu bind ngay */
+    if (g_u8AppKeyReadyMask == 0x07) {
+        app_mesh_StartGatewayModelConfig();
+    }
+
+    g_u16ProvisionedNetIdx = u16NetIdx;
+    return ERROR_CODE_OK;
 }
 
+/* ============================================================
+ *  PUBLIC API
+ * ============================================================ */
+
+int32_t app_mesh_GatewayJoin(void)
+{
+    return app_mesh_GatewayJoinNetwork(g_u16ProvisionedNetIdx);
+}
+
+bool app_mesh_GetGatewayJoined(void)
+{
+    return g_bGatewayJoined;
+}
+
+bool app_mesh_IsProvisioned(void)
+{
+    return g_stInfo.bProvisioned ||
+           (g_bMeshInitialized && esp_ble_mesh_node_is_provisioned());
+}
+
+uint8_t app_mesh_GetOnOffState(void)
+{
+    uint8_t v = 0;
+    if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+        v = g_stInfo.u8OnOffState;
+        xSemaphoreGive(g_hMeshMutex);
+    }
+    return v;
+}
+
+/* ============================================================
+ *  app_mesh_Init
+ * ============================================================ */
 int32_t app_mesh_Init(void)
 {
-    esp_err_t err;
+    if (g_bMeshInitialized) return ERROR_CODE_OK;
 
-    // lấy địa chỉ mac thiết bị để tạo UUID duy nhất
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_BT);
-    memcpy(&g_au8DevUuid[2], mac, 6);
-    LREP(TAG, "Device UUID (MAC): %02X : %02X : %02X : %02X : %02X : %02X",
-         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    /* ---- Tạo Mutex và Queue ---- */
+    g_hMeshMutex = xSemaphoreCreateMutex();
+    if (!g_hMeshMutex) return ERROR_CODE_NO_MEMORY;
 
-    // Khởi tạo bluetooth controller
+    g_hMeshEvtQ = xQueueCreate(DF_MESH_EVT_QUEUE_LEN, sizeof(st_mesh_evt_t));
+    if (!g_hMeshEvtQ) return ERROR_CODE_NO_MEMORY;
+
+    memset(&g_stInfo, 0, sizeof(g_stInfo));
+    g_stInfo.u16NetIdx = DF_MESH_HOMI_NET_KEY_IDX;
+    g_stInfo.u16AppIdx = DF_MESH_HOMI_APP_KEY_IDX_0;
+
+    /* ---- Load cấu hình từ NVS ---- */
+    app_mesh_LoadConfig();
+
+    /* ---- Tạo Task xử lý sự kiện ---- */
+    if (xTaskCreate(app_mesh_Task, "mesh_task",
+                    DF_MESH_TASK_STACK, NULL,
+                    DF_MESH_TASK_PRIO, &g_hMeshTask) != pdPASS) {
+        return ERROR_CODE_FAIL;
+    }
+
+    /* ---- UUID = {0x32, 0x10, MAC[0..5], 0..} ---- */
+    uint8_t au8Mac[6] = {0};
+    esp_read_mac(au8Mac, ESP_MAC_BT);
+    memcpy(&g_au8DevUuid[2], au8Mac, sizeof(au8Mac));
+    LREP(TAG, "Device UUID MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+         au8Mac[0], au8Mac[1], au8Mac[2], au8Mac[3], au8Mac[4], au8Mac[5]);
+
+    /* ---- Khởi tạo Bluetooth ---- */
+#if !CONFIG_IDF_TARGET_ESP32
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t err;
     err = esp_bt_controller_init(&bt_cfg);
-    if (err) {
-        LREP_ERROR(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
-        return ERROR_CODE_FAIL;
-    }
-
+    if (err != ESP_OK) { LREP_ERROR(TAG, "bt_ctrl_init: %s", esp_err_to_name(err)); return ERROR_CODE_FAIL; }
     err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (err) {
-        LREP_ERROR(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
-        return ERROR_CODE_FAIL;
-    }
-
-    // Khởi tạo bluedroid
+    if (err != ESP_OK) { LREP_ERROR(TAG, "bt_ctrl_enable: %s", esp_err_to_name(err)); return ERROR_CODE_FAIL; }
     err = esp_bluedroid_init();
-    if (err) {
-        LREP_ERROR(TAG, "esp_bluedroid_init failed: %s", esp_err_to_name(err));
-        return ERROR_CODE_FAIL;
-    }
-
+    if (err != ESP_OK) { LREP_ERROR(TAG, "bluedroid_init: %s", esp_err_to_name(err)); return ERROR_CODE_FAIL; }
     err = esp_bluedroid_enable();
-    if (err) {
-        LREP_ERROR(TAG, "esp_bluedroid_enable failed: %s", esp_err_to_name(err));
-        return ERROR_CODE_FAIL;
-    }
+    if (err != ESP_OK) { LREP_ERROR(TAG, "bluedroid_enable: %s", esp_err_to_name(err)); return ERROR_CODE_FAIL; }
 
-    // đăng ký callback (phải đăng ký trước esp_ble_mesh_init)
-    err = esp_ble_mesh_register_prov_callback(app_mesh_ProvCb);
-    if (err) {
-        LREP_ERROR(TAG, "register_prov_callback failed");
-        return ERROR_CODE_FAIL;
-    }
+    /* ---- Đăng ký Callbacks (trước esp_ble_mesh_init) ---- */
+    esp_ble_mesh_register_prov_callback(app_mesh_ProvCb);
+    esp_ble_mesh_register_config_server_callback(app_mesh_ConfigServerCb);
+    esp_ble_mesh_register_generic_server_callback(app_mesh_GenericServerCb);
+    esp_ble_mesh_register_lighting_server_callback(app_mesh_LightingServerCb);
+    esp_ble_mesh_register_custom_model_callback(app_mesh_CustomModelCb);
 
-    err = esp_ble_mesh_register_config_server_callback(app_mesh_ConfigServerCb);
-    if (err) {
-        LREP_ERROR(TAG, "register_config_server_callback failed");
-        return ERROR_CODE_FAIL;
-    }
+    /* ---- Đặt tên thiết bị ---- */
+    char acName[32];
+    snprintf(acName, sizeof(acName), "%s%02X%02X",
+             DF_MESH_DEVICE_NAME_PREFIX, au8Mac[4], au8Mac[5]);
 
-    err = esp_ble_mesh_register_generic_server_callback(app_mesh_GenericServerCb);
-    if (err) {
-        LREP_ERROR(TAG, "register_generic_server_callback failed");
-        return ERROR_CODE_FAIL;
-    }
-
-    err = esp_ble_mesh_register_lighting_server_callback(app_mesh_LightingServerCb);
-    if (err) {
-        LREP_ERROR(TAG, "register_lighting_server_callback failed");
-        return ERROR_CODE_FAIL;
-    }
-
-    err = esp_ble_mesh_register_custom_model_callback(app_mesh_CustomModelCb);
-    if (err) {
-        LREP_ERROR(TAG, "register_custom_model_callback failed");
-        return ERROR_CODE_FAIL;
-    }
-
-    /* Khởi tạo Mesh stack với Provisioning data + Composition data (15 model, 2 element) */
+    /* ---- Khởi tạo BLE Mesh stack ---- */
     err = esp_ble_mesh_init(&g_stProv, &g_stComp);
-    if (err) {
-        LREP_ERROR(TAG, "esp_ble_mesh_init failed: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        LREP_ERROR(TAG, "esp_ble_mesh_init fail: %s", esp_err_to_name(err));
         return ERROR_CODE_FAIL;
     }
+    esp_ble_mesh_set_unprovisioned_device_name(acName);
 
-    /* Bật Provisioning qua cả PB-ADV và PB-GATT (nRF Mesh trên điện thoại dùng PB-GATT) */
+    /* ---- Bật Provisioning (PB-ADV + PB-GATT) ---- */
     err = esp_ble_mesh_node_prov_enable(
-        (esp_ble_mesh_prov_bearer_t)(
-            ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT
-        )
-    );
-    if (err) {
-        LREP_ERROR(TAG, "node_prov_enable failed: %s", esp_err_to_name(err));
+        (esp_ble_mesh_prov_bearer_t)(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT));
+    if (err != ESP_OK) {
+        LREP_ERROR(TAG, "prov_enable fail: %s", esp_err_to_name(err));
         return ERROR_CODE_FAIL;
     }
 
     g_bMeshInitialized = true;
-    g_bProvisioned = esp_ble_mesh_node_is_provisioned();
 
-    LREP(TAG, "BLE Mesh Node khởi tạo thành công. Provisioned: %s",
-         g_bProvisioned ? "YES" : "NO");
-
-
-    /* GatewayJoin KHONG tu chay -- de provisioner (nRF Mesh hoac HOMI gateway)
-     * tu gui Config AppKey Add / Model App Bind / Model Subscription Add.
-     * Goi app_mesh_GatewayJoin() thu cong (lenh 'meshjoin') khi can join HOMI. */
-    return ERROR_CODE_OK;
-}
-
-// ==================== Gateway Join ====================
-static void app_mesh_JoinTask(void *pvArg)
-{
-    vTaskDelay(pdMS_TO_TICKS(500)); // chờ link provisioning đóng hẳn
-    uint16_t u16Base = esp_ble_mesh_get_primary_element_address();
-    LREP(TAG, "[JOIN] bắt đầu, element gốc 0x%04x", u16Base);
-
-    /* 1. Thêm AppKey HOMI (đã tồn tại thì lỗi này vô hại) */
-    xSemaphoreTake(g_semAppKey, 0);
-    esp_err_t err = esp_ble_mesh_node_add_local_app_key(
-        g_au8HomiAppKey,
-        g_u16NetIdx,
-        DF_HOMI_APPKEY_IDX
-    );
-
-    if (err == ESP_OK) {
-        xSemaphoreTake(g_semAppKey, pdMS_TO_TICKS(2000));
-    } else {
-        LREP_WARNING(TAG, "[JOIN] add_local_app_key: %s", esp_err_to_name(err));
-    }
-
-    /* 2. Bind AppKey rồi subscribe Group 0xC000 cho từng model */
-    for (size_t i = 0; i < ARRAY_SIZE(g_astJoin); i++) {
-        uint16_t u16Elem = u16Base + g_astJoin[i].u8Elem;
-
-        err = esp_ble_mesh_node_bind_app_key_to_local_model(
-            u16Elem,
-            g_astJoin[i].u16Cid,
-            g_astJoin[i].u16ModelId,
-            g_u16AppIdx
-        );
-
-        if (err != ESP_OK) {
-            LREP_WARNING(TAG, "[JOIN] bind 0x%04x: %s",
-                         g_astJoin[i].u16ModelId,
-                         esp_err_to_name(err));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(30));
-
-        if (g_astJoin[i].bSub) {
-            err = esp_ble_mesh_model_subscribe_group_addr(
-                u16Elem,
-                g_astJoin[i].u16Cid,
-                g_astJoin[i].u16ModelId,
-                DF_HOMI_GROUP_ADDR
-            );
-
-            if (err != ESP_OK) {
-                LREP_WARNING(TAG, "[JOIN] sub 0x%04x: %s",
-                             g_astJoin[i].u16ModelId,
-                             esp_err_to_name(err));
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-    }
-
-    LREP(TAG, "[JOIN] hoàn tất (xem các dòng BIND_COMP / SUB_COMP phía trên)");
-    g_bJoinRunning = false;
-    vTaskDelete(NULL);
-}
-
-int32_t app_mesh_GatewayJoin(void)
-{
-    if (!g_bMeshInitialized && !g_bProvisioned) {
-        return ERROR_CODE_FAIL;
-    }
-
-    if (!app_mesh_IsProvisioned()) {
-        return ERROR_CODE_FAIL;
-    }
-
-    if (g_bJoinRunning) {
-        return ERROR_CODE_BUSY;
-    }
-
-    if (g_semAppKey == NULL) {
-        g_semAppKey = xSemaphoreCreateBinary();
-        if (g_semAppKey == NULL) {
-            return ERROR_CODE_NO_MEMORY;
-        }
-    }
-
-    g_bJoinRunning = true;
-    if (xTaskCreate(app_mesh_JoinTask, "mesh_join", 4096, NULL, 5, NULL) != pdPASS) {
-        g_bJoinRunning = false;
-        return ERROR_CODE_NO_MEMORY;
-    }
+    bool bProv = esp_ble_mesh_node_is_provisioned();
+    LREP(TAG, "BLE Mesh khoi tao OK. Name=%s Prov=%s", acName, bProv ? "YES" : "NO");
 
     return ERROR_CODE_OK;
 }
 
-// ==================== Các API hỗ trợ khác ====================
-bool app_mesh_IsProvisioned(void)
+/* ============================================================
+ *  app_mesh_Reset
+ * ============================================================ */
+int32_t app_mesh_Reset(void)
 {
-    return g_bProvisioned ||
-           (g_bMeshInitialized && esp_ble_mesh_node_is_provisioned());
+    if (!g_bMeshInitialized) return ERROR_CODE_FAIL;
+    esp_err_t err = esp_ble_mesh_node_local_reset();
+    if (err != ESP_OK) {
+        LREP_ERROR(TAG, "node_local_reset fail: %s", esp_err_to_name(err));
+        return ERROR_CODE_FAIL;
+    }
+    if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+        memset(&g_stInfo, 0, sizeof(g_stInfo));
+        xSemaphoreGive(g_hMeshMutex);
+    }
+    g_bGatewayConfigStarted = false;
+    g_bGatewayJoined        = false;
+    g_u8AppKeyReadyMask     = 0;
+    LREP(TAG, "Da reset mesh ve Unprovisioned");
+    return ERROR_CODE_OK;
 }
 
+/* ============================================================
+ *  PRINT STATUS / MODELS (Console commands)
+ * ============================================================ */
 void app_mesh_PrintStatus(void)
 {
-    printf("\n=== Trạng Thái Bluetooth Mesh ===\n");
-    printf("Initialized : %s\n", g_bMeshInitialized ? "YES" : "NO");
-    printf("Provisioned : %s\n", app_mesh_IsProvisioned() ? "YES" : "NO");
-    printf("Unicast     : 0x%04X\n", g_u16Unicast);
-    printf("NetIdx      : 0x%04X\n", g_u16NetIdx);
-    printf("AppIdx      : 0x%04X\n", g_u16AppIdx);
-    printf("OnOff State : %s\n", g_u8OnOffState ? "ON" : "OFF");
-    printf("===========================\n\n");
+    st_mesh_info_t snap;
+    if (g_hMeshMutex && xSemaphoreTake(g_hMeshMutex, pdMS_TO_TICKS(DF_LOCK_TIMEOUT_MS))) {
+        snap = g_stInfo;
+        xSemaphoreGive(g_hMeshMutex);
+    } else {
+        snap = g_stInfo;
+    }
+
+    bool bProv    = app_mesh_IsProvisioned();
+    uint16_t addr = bProv ? esp_ble_mesh_get_primary_element_address() : 0;
+
+    printf("\n========================================\n");
+    printf("       THONG TIN BLE MESH FIRE NODE     \n");
+    printf("========================================\n");
+    printf("Trang thai     : %s\n", bProv ? "DA PROVISION" : "CHUA PROVISION");
+    printf("Unicast Addr   : 0x%04X\n", addr);
+    printf("NetIdx / AppIdx: 0x%04X / 0x%04X\n", snap.u16NetIdx, snap.u16AppIdx);
+    printf("GatewayJoined  : %s\n", g_bGatewayJoined ? "YES" : "NO");
+    printf("AppKey Mask    : 0x%02X (7=OK)\n", g_u8AppKeyReadyMask);
+    printf("Group Sub'd    : 0x%04X\n", snap.u16Group);
+    printf("OnOff State    : %s\n", snap.u8OnOffState ? "ON" : "OFF");
+    printf("Vendor RX cnt  : %lu\n", (unsigned long)snap.u32RxVendorCount);
+    printf("Evt Drop count : %lu\n", (unsigned long)g_u32DropEvt);
+    printf("========================================\n\n");
 }
 
-static void app_mesh_PrintModelArr(
-    const char *pcName,
-    const esp_ble_mesh_model_t *pModels,
-    size_t n,
-    bool bVendor
-) {
-    for (size_t i = 0; i < n; i++) {
-        uint16_t u16Id = bVendor ? pModels[i].vnd.model_id : pModels[i].model_id;
+static void app_mesh_PrintModelInfo(const char *pcElemLabel,
+                                    const esp_ble_mesh_model_t *pModels,
+                                    size_t nModels, bool bVendor)
+{
+    for (size_t i = 0; i < nModels; i++) {
+        uint16_t u16Id  = bVendor ? pModels[i].vnd.model_id : pModels[i].model_id;
         uint16_t u16Cid = bVendor ? pModels[i].vnd.company_id : 0xFFFF;
 
-        printf("%-6s cid 0x%04X id 0x%04X | key0 0x%04X | grp0 0x%04X\n",
-               pcName,
-               u16Cid,
-               u16Id,
-               pModels[i].keys[0],
-               pModels[i].groups[0]);
+        printf("  [%s] %s id=0x%04X cid=0x%04X\n",
+               pcElemLabel,
+               bVendor ? "VND" : "SIG",
+               u16Id, u16Cid);
+
+        /* In AppKey đã bind */
+        printf("    Keys  :");
+        bool bAnyKey = false;
+        for (size_t k = 0; k < ARRAY_SIZE(pModels[i].keys); k++) {
+            if (pModels[i].keys[k] != 0xFFFF) {
+                printf(" 0x%04X", pModels[i].keys[k]);
+                bAnyKey = true;
+            }
+        }
+        if (!bAnyKey) printf(" (chua bind)");
+        printf("\n");
+
+        /* In Group đã subscribe */
+        printf("    Groups:");
+        bool bAnyGrp = false;
+        for (size_t g = 0; g < ARRAY_SIZE(pModels[i].groups); g++) {
+            if (pModels[i].groups[g] != 0 && pModels[i].groups[g] != 0xFFFF) {
+                printf(" 0x%04X", pModels[i].groups[g]);
+                bAnyGrp = true;
+            }
+        }
+        if (!bAnyGrp) printf(" (chua subscribe)");
+        printf("\n");
     }
 }
 
 void app_mesh_PrintModels(void)
 {
-    printf("\n=== Models (key 0xFFFF = chưa bind, grp 0x0000/0xFFFF = chưa "
-           "subscribe) ===\n");
-
-    app_mesh_PrintModelArr(
-        "elem0",
-        g_astRootModels,
-        ARRAY_SIZE(g_astRootModels),
-        false
-    );
-
-    app_mesh_PrintModelArr(
-        "elem0",
-        g_astVndModels,
-        ARRAY_SIZE(g_astVndModels),
-        true
-    );
-
-    app_mesh_PrintModelArr(
-        "elem1",
-        g_astSecModels,
-        ARRAY_SIZE(g_astSecModels),
-        false
-    );
-
-    printf("\n");
-}
-
-int32_t app_mesh_Reset(void)
-{
-    if (!g_bMeshInitialized) {
-        return ERROR_CODE_FAIL;
-    }
-
-    esp_err_t err = esp_ble_mesh_node_local_reset();
-    if (err != ESP_OK) {
-        LREP_ERROR(TAG, "node_local_reset failed");
-        return ERROR_CODE_FAIL;
-    }
-
-    g_bProvisioned = false;
-    g_u16Unicast = 0;
-    LREP(TAG, "Đã reset mesh về Unprovisioned");
-
-    return ERROR_CODE_OK;
-}
-
-uint8_t app_mesh_GetOnOffState(void)
-{
-    return g_u8OnOffState;
+    printf("\n=== CHI TIET MODELS (keys=0xFFFF nghia la chua bind) ===\n");
+    app_mesh_PrintModelInfo("elem0-SIG", g_astRootModels, ARRAY_SIZE(g_astRootModels), false);
+    app_mesh_PrintModelInfo("elem0-VND", g_astVndModels,  ARRAY_SIZE(g_astVndModels),  true);
+    app_mesh_PrintModelInfo("elem1-SIG", g_astSecModels,  ARRAY_SIZE(g_astSecModels),  false);
+    printf("========================================================\n\n");
 }

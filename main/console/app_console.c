@@ -1,4 +1,4 @@
-﻿#include "app_console.h"
+#include "app_console.h"
 #include "app_common.h"
 #include "app_config.h"
 #include "app_blemesh.h"
@@ -71,6 +71,12 @@ static int app_console_CmdMesh(int argc, char **argv){
     return 0;
 }
 
+/* [MỚI] In chi tiết AppKey + Group của từng model */
+static int app_console_CmdMeshModels(int argc, char **argv){
+    app_mesh_PrintModels();
+    return 0;
+}
+
 static int app_console_CmdMeshReset(int argc, char **argv){
     return (app_mesh_Reset() == ERROR_CODE_OK) ? 0 : 1;
 }
@@ -129,11 +135,20 @@ static void app_console_RegisterCommands(void)
 
     const esp_console_cmd_t stCmdMesh = {
         .command = "mesh",
-        .help    = "In trạng thái BLE Mesh",
+        .help    = "In trạng thái BLE Mesh (Unicast, AppKey mask, Vendor RX count...)",
         .hint    = NULL,
         .func    = &app_console_CmdMesh,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMesh));
+
+    /* [MỚI] Lệnh meshmodels */
+    const esp_console_cmd_t stCmdMeshModels = {
+        .command = "meshmodels",
+        .help    = "In chi tiet tung model: AppKey da bind, Group da subscribe",
+        .hint    = NULL,
+        .func    = &app_console_CmdMeshModels,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshModels));
 
     const esp_console_cmd_t stCmdMeshReset = {
         .command = "meshreset",
@@ -143,10 +158,9 @@ static void app_console_RegisterCommands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshReset));
 
-
     const esp_console_cmd_t stCmdMeshJoin = {
         .command = "meshjoin",
-        .help    = "Tu dong them AppKey HOMI, bind va subscribe tat ca model",
+        .help    = "Tu dong them 3 AppKey HOMI, bind va subscribe tat ca model vao Group 0xC000",
         .hint    = NULL,
         .func    = &app_console_CmdMeshJoin,
     };
