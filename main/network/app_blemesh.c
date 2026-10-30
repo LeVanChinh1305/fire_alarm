@@ -169,6 +169,7 @@ static const uint8_t g_au8HealthTestIds[] = { 0x00 };
 static esp_ble_mesh_health_srv_t g_stHealthSrv = {
     .health_test.id_count = ARRAY_SIZE(g_au8HealthTestIds),
     .health_test.test_ids = g_au8HealthTestIds,
+    .health_test.company_id = DF_MESH_VND_COMPANY_ID,
 };
 static esp_ble_mesh_client_t g_stHealthCli;
 
@@ -320,7 +321,7 @@ typedef struct {
 static const df_join_item_t g_astJoin[] = {
     /* Element 0 – SIG models */
     { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_SRV,                    true  },
-    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_CLI,                    false },
+    { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_CLI,                    true  },
     { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_SRV,                 true  },
     { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_LEVEL_SRV,                 true  },
     { 0, ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_DEF_TRANS_TIME_SRV,        true  },
@@ -523,10 +524,22 @@ static void app_mesh_GenericServerCb(esp_ble_mesh_generic_server_cb_event_t eEve
     switch (pstParam->ctx.recv_op) {
     case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET:
     case ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK:
-        stEvt.eType  = MESH_EVT_ONOFF_SET;
-        stEvt.u8OnOff = pstParam->value.state_change.onoff_set.onoff;
-        LREP(TAG, "[GEN] OnOff -> %s (src=0x%04X)", stEvt.u8OnOff ? "ON" : "OFF", stEvt.u16Src);
-        app_mesh_PostEvt(&stEvt);
+        uint8_t onoff = pstParam->value.state_change.onoff_set.onoff;
+        uint16_t src  = pstParam->ctx.addr;
+        uint16_t dst  = pstParam->ctx.recv_dst;
+        int8_t  rssi  = pstParam->ctx.recv_rssi;
+        uint8_t ttl   = pstParam->ctx.recv_ttl;
+
+        bool bIsGroup = (dst >= 0xC000 && dst <= 0xFEFF);
+        const char *pcType = bIsGroup ? "PUBLISH/GROUP" : "SET";
+
+        LREP(TAG, "[ONOFF %s] src=0x%04X dst=0x%04X → %s | rssi=%d ttl=%u",
+            pcType, src, dst, onoff ? "ON" : "OFF", rssi, ttl);
+
+        /* Cập nhật state */
+        g_stInfo.u8OnOffState = onoff;
+        g_stOnoffSrv.state.onoff = onoff;
+
         break;
 
     case ESP_BLE_MESH_MODEL_OP_GEN_LEVEL_SET:
@@ -656,6 +669,113 @@ static void app_mesh_CustomModelCb(esp_ble_mesh_model_cb_event_t eEvent,
     }
 }
 
+
+static void app_mesh_HealthClientCb(
+    esp_ble_mesh_health_client_cb_event_t event,
+    esp_ble_mesh_health_client_cb_param_t *param)
+{
+    if (param == NULL) {
+        return;
+    }
+
+    uint16_t dst = 0;
+    uint32_t opcode = 0;
+
+    if (param->params != NULL) {
+        dst = param->params->ctx.addr;
+        opcode = param->params->opcode;
+    }
+
+    switch (event) {
+
+    case ESP_BLE_MESH_HEALTH_CLIENT_GET_STATE_EVT:
+
+        if (param->error_code != 0) {
+            LREP_ERROR(TAG,
+                "[HEALTH CLI] GET failed: dst=0x%04X err=%d",
+                dst, param->error_code);
+            break;
+        }
+
+        switch (opcode) {
+
+        case ESP_BLE_MESH_MODEL_OP_HEALTH_FAULT_GET:
+        {
+            esp_ble_mesh_health_fault_status_cb_t *p =
+                &param->status_cb.fault_status;
+
+            LREP(TAG,
+                "[HEALTH] FAULT STATUS: dst=0x%04X "
+                "company=0x%04X test=0x%02X",
+                dst, p->company_id, p->test_id);
+
+            if (p->fault_array != NULL) {
+                LREP(TAG, "[HEALTH] Fault count=%u",
+                     p->fault_array->len);
+
+                for (uint16_t i = 0;
+                     i < p->fault_array->len; i++) {
+
+                    LREP(TAG,
+                        "[HEALTH] Fault[%u] = 0x%02X",
+                        i, p->fault_array->data[i]);
+                }
+            }
+            break;
+        }
+
+        case ESP_BLE_MESH_MODEL_OP_ATTENTION_GET:
+
+            LREP(TAG,
+                "[HEALTH] Attention=%u seconds",
+                param->status_cb.attention_status.attention);
+            break;
+
+        case ESP_BLE_MESH_MODEL_OP_HEALTH_PERIOD_GET:
+
+            LREP(TAG,
+                "[HEALTH] Fast Period Divisor=%u",
+                param->status_cb.period_status.fast_period_divisor);
+            break;
+
+        default:
+            LREP(TAG,
+                "[HEALTH] GET response opcode=0x%08lX",
+                (unsigned long)opcode);
+            break;
+        }
+        break;
+
+    case ESP_BLE_MESH_HEALTH_CLIENT_SET_STATE_EVT:
+
+        LREP(TAG,
+            "[HEALTH CLI] SET event: dst=0x%04X "
+            "opcode=0x%08lX err=%d",
+            dst, (unsigned long)opcode, param->error_code);
+        break;
+
+    case ESP_BLE_MESH_HEALTH_CLIENT_PUBLISH_EVT:
+
+        /* Chỉ xác nhận đã nhận Health Publish, không phân tích payload. */
+        LREP(TAG,
+            "[HEALTH CLI] *** RECEIVED HEALTH PUBLISH *** "
+            "src=0x%04X opcode=0x%08lX",
+            dst,
+            (unsigned long)opcode);
+        break;
+
+    case ESP_BLE_MESH_HEALTH_CLIENT_TIMEOUT_EVT:
+
+        LREP_ERROR(TAG,
+            "[HEALTH CLI] TIMEOUT: dst=0x%04X opcode=0x%08lX",
+            dst, (unsigned long)opcode);
+        break;
+
+    default:
+        break;
+    }
+}
+
 /* ============================================================
  *  GATEWAY JOIN – Logic bất đồng bộ
  * ============================================================ */
@@ -751,28 +871,41 @@ static void app_mesh_StartModelBindings(void)
     LREP(TAG, "[GW] Queued %u bind ops", g_u8BindPendingCount);
 }
 
-/** Subscribe Group cho OnOff Srv + Vendor Srv (hai model quan trọng nhất) */
+/** Subscribe Group cho Health Client, OnOff Server và Vendor Server. */
 static void app_mesh_StartGroupSubscribe(uint16_t u16GroupAddr)
 {
     uint16_t u16Prim = esp_ble_mesh_get_primary_element_address();
     g_u8GroupPendingCount = 0;
     g_bGroupConfigFailed  = false;
 
-    typedef struct { esp_ble_mesh_model_t *pst; uint16_t cid; uint16_t mid; } sub_target_t;
+    typedef struct {
+        esp_ble_mesh_model_t *pst;
+        uint16_t cid;
+        uint16_t mid;
+    } sub_target_t;
+
     sub_target_t aTargets[] = {
+        /* Health Client nhận Health Current Status Publish */
+        { &g_astRootModels[2], ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_HEALTH_CLI },
+        /* Các model đang subscribe từ trước */
         { &g_astRootModels[3], ESP_BLE_MESH_CID_NVAL, ESP_BLE_MESH_MODEL_ID_GEN_ONOFF_SRV },
         { &g_astVndModels[0],  DF_MESH_VND_COMPANY_ID, DF_MESH_VND_MODEL_ID_SERVER },
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(aTargets); i++) {
-        /* Kiểm tra đã subscribe chưa */
-        if (esp_ble_mesh_is_model_subscribed_to_group(aTargets[i].pst, u16GroupAddr) != NULL) {
+        if (esp_ble_mesh_is_model_subscribed_to_group(
+                aTargets[i].pst, u16GroupAddr) != NULL) {
+            LREP(TAG, "[GW] Model 0x%04X already subscribed to 0x%04X",
+                 aTargets[i].mid, u16GroupAddr);
             continue;
         }
+
         esp_err_t err = esp_ble_mesh_model_subscribe_group_addr(
             u16Prim, aTargets[i].cid, aTargets[i].mid, u16GroupAddr);
         if (err == ESP_OK) {
             g_u8GroupPendingCount++;
+            LREP(TAG, "[GW] Subscribe queued: model=0x%04X group=0x%04X",
+                 aTargets[i].mid, u16GroupAddr);
         } else {
             g_bGroupConfigFailed = true;
             LREP_ERROR(TAG, "[GW] Subscribe grp 0x%04X model=0x%04X fail: %s",
@@ -1086,7 +1219,14 @@ int32_t app_mesh_Init(void)
     esp_ble_mesh_register_generic_server_callback(app_mesh_GenericServerCb);
     esp_ble_mesh_register_lighting_server_callback(app_mesh_LightingServerCb);
     esp_ble_mesh_register_custom_model_callback(app_mesh_CustomModelCb);
+    err = esp_ble_mesh_register_health_client_callback(app_mesh_HealthClientCb);
 
+    if (err != ESP_OK) {
+        LREP_ERROR(TAG,
+            "Register Health Client callback failed: %s",
+            esp_err_to_name(err));
+        return ERROR_CODE_FAIL;
+    }
     /* ---- Đặt tên thiết bị ---- */
     char acName[32];
     snprintf(acName, sizeof(acName), "%s%02X%02X",
@@ -1215,4 +1355,64 @@ void app_mesh_PrintModels(void)
     app_mesh_PrintModelInfo("elem0-VND", g_astVndModels,  ARRAY_SIZE(g_astVndModels),  true);
     app_mesh_PrintModelInfo("elem1-SIG", g_astSecModels,  ARRAY_SIZE(g_astSecModels),  false);
     printf("========================================================\n\n");
+}
+
+
+int32_t app_mesh_HealthFaultGet(uint16_t dst)
+{
+    if (!app_mesh_IsProvisioned()) {
+        LREP_ERROR(TAG, "Mesh node is not provisioned");
+        return ERROR_CODE_FAIL;
+    }
+
+    if (dst < 0x0001 || dst > 0x7FFF) {
+        LREP_ERROR(TAG, "Invalid unicast address: 0x%04X", dst);
+        return ERROR_CODE_FAIL;
+    }
+
+    esp_ble_mesh_client_common_param_t common = {0};
+
+    esp_ble_mesh_health_client_get_state_t get = {0};
+
+    /* Opcode Health Fault Get */
+    common.opcode =
+        ESP_BLE_MESH_MODEL_OP_HEALTH_FAULT_GET;
+
+    /* Health Client Model ở Element 0, index 2 */
+    common.model = &g_astRootModels[2];
+
+    /* Thông tin mạng */
+    common.ctx.net_idx = g_u16ProvisionedNetIdx;
+
+    /* AppKey đã được GatewayJoin thêm */
+    common.ctx.app_idx = DF_MESH_HOMI_APP_KEY_IDX_0;
+
+    /* Địa chỉ thiết bị Health Server cần kiểm tra */
+    common.ctx.addr = dst;
+
+    common.ctx.send_ttl = 7;
+    common.ctx.send_rel = false;
+
+    /* Timeout 5 giây */
+    common.msg_timeout = 5000;
+
+    /* Company ID của Health Server */
+    get.fault_get.company_id = DF_MESH_COMPANY_ID;
+
+    esp_err_t err = esp_ble_mesh_health_client_get_state(
+                        &common, &get);
+
+    if (err != ESP_OK) {
+        LREP_ERROR(TAG,
+            "Health Fault Get send failed: %s",
+            esp_err_to_name(err));
+
+        return ERROR_CODE_FAIL;
+    }
+
+    LREP(TAG,
+        "[HEALTH] Fault Get sent to 0x%04X",
+        dst);
+
+    return ERROR_CODE_OK;
 }

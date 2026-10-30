@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,3 +52,6 @@ void app_mesh_PrintStatus(void);
  *        Dùng cho lệnh console "meshmodels".
  */
 void app_mesh_PrintModels(void);
+
+
+int32_t app_mesh_HealthFaultGet(uint16_t dst);

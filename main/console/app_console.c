@@ -1,4 +1,4 @@
-#include "app_console.h"
+﻿#include "app_console.h"
 #include "app_common.h"
 #include "app_config.h"
 #include "app_blemesh.h"
@@ -88,6 +88,34 @@ static int app_console_CmdMeshJoin(int argc, char **argv){
     else                             { printf("GatewayJoin that bai (chua provision?)\n"); return 1; }
 }
 
+static int app_console_CmdHealthFaultGet(
+    int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: healthfaultget <unicast_addr>\n");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    unsigned long addr = strtoul(argv[1], &endptr, 0);
+
+    if (endptr == argv[1] || *endptr != '\0' ||
+        addr < 0x0001 || addr > 0x7FFF) {
+        printf("Invalid unicast address\n");
+        return 1;
+    }
+
+    int32_t ret = app_mesh_HealthFaultGet((uint16_t)addr);
+
+    if (ret == ERROR_CODE_OK) {
+        printf("Health Fault Get sent to 0x%04lX\n", addr);
+        return 0;
+    }
+
+    printf("Health Fault Get failed\n");
+    return 1;
+}
+
 
 /* ================== ĐĂNG KÝ LỆNH ================== */
 
@@ -165,6 +193,15 @@ static void app_console_RegisterCommands(void)
         .func    = &app_console_CmdMeshJoin,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshJoin));
+
+    const esp_console_cmd_t stCmdHealth = {
+        .command = "health",
+        .help = "Get Health Fault Status (healthfaultget <addr>)",
+        .hint = NULL,
+        .func = &app_console_CmdHealthFaultGet,
+    };
+
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdHealth));
 }
 
 /* ================== KHỞI TẠO CONSOLE ================== */
