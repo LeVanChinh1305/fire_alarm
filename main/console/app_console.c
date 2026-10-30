@@ -1,4 +1,4 @@
-#include "app_console.h"
+﻿#include "app_console.h"
 #include "app_common.h"
 #include "app_config.h"
 #include "app_blemesh.h"
@@ -75,19 +75,13 @@ static int app_console_CmdMeshReset(int argc, char **argv){
     return (app_mesh_Reset() == ERROR_CODE_OK) ? 0 : 1;
 }
 
-static int app_console_CmdMeshSend(int argc, char **argv)
-{
-    if (argc < 3) {
-        printf("Cú pháp: meshsend <dia_chi_hex> <0|1>\n");
-        printf("Ví dụ  : meshsend 0x0002 1\n");
-        return 1;
-    }
-
-    uint16_t addr = (uint16_t)strtoul(argv[1], NULL, 0);
-    uint8_t  onoff = (uint8_t)atoi(argv[2]);
-
-    return (app_mesh_SendOnOff(addr, onoff) == ERROR_CODE_OK) ? 0 : 1;
+static int app_console_CmdMeshJoin(int argc, char **argv){
+    int32_t ret = app_mesh_GatewayJoin();
+    if (ret == ERROR_CODE_OK)        { printf("GatewayJoin da bat dau (xem log BIND_COMP / SUB_COMP)\n"); return 0; }
+    else if (ret == ERROR_CODE_BUSY) { printf("GatewayJoin dang chay...\n"); return 0; }
+    else                             { printf("GatewayJoin that bai (chua provision?)\n"); return 1; }
 }
+
 
 /* ================== ĐĂNG KÝ LỆNH ================== */
 
@@ -149,13 +143,14 @@ static void app_console_RegisterCommands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshReset));
 
-    const esp_console_cmd_t stCmdMeshSend = {
-        .command = "meshsend",
-        .help    = "Gui Generic OnOff: meshsend <dst_hex> <0|1>",
+
+    const esp_console_cmd_t stCmdMeshJoin = {
+        .command = "meshjoin",
+        .help    = "Tu dong them AppKey HOMI, bind va subscribe tat ca model",
         .hint    = NULL,
-        .func    = &app_console_CmdMeshSend,
+        .func    = &app_console_CmdMeshJoin,
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshSend));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stCmdMeshJoin));
 }
 
 /* ================== KHỞI TẠO CONSOLE ================== */
